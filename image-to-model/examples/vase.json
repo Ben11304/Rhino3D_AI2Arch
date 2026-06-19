@@ -25,6 +25,21 @@
   },
   "parts": [
     {
+      "id": "table",
+      "layer": "ground",
+      "provenance": "table surface the vase stands on; publishes a plane_z support (§13 PREVENT) so the vase's seating is a declared, measurable contact. Scale-invariant: sized relative to the vase footprint, not an absolute number (image pipeline).",
+      "primitive": "box",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [0, 0, -10]
+      },
+      "dims": { "x": 400, "y": 400, "z": 20 },
+      "support": {
+        "kind": "plane_z",
+        "value": 0
+      }
+    },
+    {
       "id": "vase_profile",
       "layer": "profile",
       "provenance": "averaged left+right silhouette from reference image via extract_profile.py; ogee_vase archetype confirmed by render-vs-reference loop; control points start and end on the revolve axis (C6)",
@@ -67,9 +82,12 @@
       "provenance": "hollow the capped revolve solid into a thin-walled vessel, leaving the top face open (C6: cap before shell, closed brep required by Brep.CreateOffset solid=true)",
       "operation": "shell",
       "inputs": ["vase_solid"],
-      "thickness": 4,
+      "thickness": { "param": "wall_thickness" },
       "open_face": 1,
-      "result": "vase_hollow"
+      "result": "vase_hollow",
+      "relations": [
+        { "type": "lands_on", "to": "table", "at_surface": "top" }
+      ]
     }
   ],
   "verify": {

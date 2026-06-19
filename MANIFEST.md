@@ -8,7 +8,7 @@ Every file in the tree with a one-line purpose. Paths are relative to the repo r
 
 | File | Purpose |
 |------|---------|
-| `README.md` | Overview, layered architecture diagram, 8-skill table, modeling cognition loop, IR contract pointer, the 8 corrections, and the phased roadmap. |
+| `README.md` | Overview, layered architecture diagram, 8-skill table, modeling cognition loop, IR contract pointer, the 9 corrections, and the phased roadmap. |
 | `INSTALL.md` | How to install (symlink/copy each skill dir + `shared/` into a `skills/` folder), knowledge-skill note, target MCP server, and the required/recommended MCP extensions. |
 | `MANIFEST.md` | This file — every file with a one-line purpose. |
 
@@ -16,7 +16,7 @@ Every file in the tree with a one-line purpose. Paths are relative to the repo r
 
 | File | Purpose |
 |------|---------|
-| `shared/conventions.md` | The canonical rules every skill links to: units/tolerance (§1), GUID ledger C1 (§2), naming/layers/UserString (§3), frame discipline (§4), the 9-point codegen guard contract (§5), interpenetration C3 (§6), revolve/shell C6 (§7), vision-demotion C4 (§8), ratio-vs-absolute C5 (§9), repair budget C8 (§10), token economy (§11). |
+| `shared/conventions.md` | The canonical rules every skill links to: units/tolerance (§1), GUID ledger C1 (§2), naming/layers/UserString (§3), frame discipline (§4), the 10-point codegen guard contract (§5), interpenetration C3 (§6), revolve/shell C6 (§7), vision-demotion C4 (§8), ratio-vs-absolute C5 (§9), repair budget C8 (§10), token economy (§11), scoped idempotent staging (§12), connectivity C9 (§13), and the direction-pin idiom (§5a). |
 | `shared/build-plan.schema.json` `[json]` | JSON Schema (draft 2020-12, `additionalProperties:false` throughout) for the build-plan IR shared by text-to-model, image-to-model, and rhino-scene-state. |
 
 ## rhino-modeling/ — router / orchestrator
@@ -27,18 +27,18 @@ Every file in the tree with a one-line purpose. Paths are relative to the repo r
 | `rhino-modeling/reference/workflow.md` | The full cognition loop in detail: phases P0..P8 with decision points and the sibling that owns each phase; honors C1–C8. |
 | `rhino-modeling/reference/token-economy.md` | Concrete token-budget rules and the four-bucket cost model; scene-graph as cache; interaction with the C8 repair budget. |
 | `rhino-modeling/reference/server-capabilities.md` | How rhinomcp / grasshopper-mcp / lamcp / SerjoschDuering surfaces differ, the classification heuristics, and the v1 "pick ONE server" rule. |
-| `rhino-modeling/scripts/detect_server.py` `[py]` | Classifies the connected MCP server flavor from its tool names (text or `--json`), reports the recommended surface, present/missing loop capabilities, exec-only ops, and the pick-one recommendation. |
+| `rhino-modeling/scripts/detect_server.py` `[py]` | Classifies the connected MCP server flavor from its tool names (text or `--json`), reports the recommended surface, present/missing loop capabilities, exec-only ops, and the pick-one recommendation. `--rhinocommon-probe` emits a `hasattr` capability map for fragile RhinoCommon methods (Brep.CreateOffset / RevSurface.Create / network surface) so a missing method degrades visibly. |
 
 ## rhino-geometry-api/ — knowledge (user-invocable:false)
 
 | File | Purpose |
 |------|---------|
-| `rhino-geometry-api/SKILL.md` | Knowledge entry point: the HARD RULE (docs before any `execute_*`/`gh_add_component`), the 9-point codegen guard summary, one-level-deep links. |
+| `rhino-geometry-api/SKILL.md` | Knowledge entry point: the HARD RULE (docs before any `execute_*`/`gh_add_component`), the 10-point codegen guard summary, one-level-deep links. |
 | `rhino-geometry-api/reference/geometry-ops.md` | Per-op cheat-sheets with real RhinoCommon names + C7 pre-flight + C2/C3 post-checks: loft, sweep1, revolve, extrude, boolean, fillet, offset, network surface; plus a failure-signal table. |
 | `rhino-geometry-api/reference/rhinocommon.md` | Core RhinoCommon idioms: rs-vs-RhinoCommon-vs-CPython3 decision table, booleans/loft/revolve/offset, `ObjectAttributes`/`SetUserString`, `AddBrep` returning the GUID, and the measuring idioms for the verify loop. |
 | `rhino-geometry-api/reference/types-and-conversions.md` | NURBS/Brep/SubD/Mesh reliable-vs-fragile matrix, conversion functions with gotchas, and how to pick the build type per IR primitive/operation. |
 | `rhino-geometry-api/reference/tolerance-units.md` | Read-don't-hardcode tolerance rules, setting the unit system before geometry, `overall_height_mm` always-mm conversion, and the C3 tolerance-vs-penetration interaction. |
-| `rhino-geometry-api/scripts/codegen_guard.py` `[py]` | Linter/wrapper for the 9-point codegen contract: `--lint` prints PASS/WARN/FAIL per rule (exit 1 on FAIL); `--wrap` brackets the snippet with a live-tolerance preamble + single-redraw postamble. |
+| `rhino-geometry-api/scripts/codegen_guard.py` `[py]` | Linter/wrapper for the 10-point codegen contract: `--lint` prints PASS/WARN/FAIL per rule (exit 1 on FAIL); `--wrap` brackets the snippet with a live-tolerance preamble + single-redraw postamble. |
 
 ## text-to-model/ — text producer
 
@@ -47,7 +47,7 @@ Every file in the tree with a one-line purpose. Paths are relative to the repo r
 | `text-to-model/SKILL.md` | Text-pipeline entry point: 8-step workflow (units → clarify ≤3 dims → emit IR → validate → parameterize in local frames → typed-tool emit + interpenetrating booleans → reconcile+measure → render-and-look ≤3). Verifies absolutes. |
 | `text-to-model/reference/part-recipes.md` | Four concrete parametric recipes (assembly-of-primitives, revolve, loft, extrude) as IR fragments + the typed MCP tool sequence, with real RhinoCommon names. |
 | `text-to-model/examples/chair.json` `[json]` | Complete valid build-plan IR: four-legged chair (seat + 4 interpenetrating legs + back) unioned into one solid; symmetry, params, and a verify block; validates clean. |
-| `text-to-model/scripts/validate_plan.py` `[py]` | Stdlib-only build-plan IR validator: required fields, units enum, per-number unit+frame, primitive XOR operation, C3 penetration on union joins, C6 profile-on-axis, scale well-formedness, C5 confidence routing, bbox sanity. Exits non-zero on failure. |
+| `text-to-model/scripts/validate_plan.py` `[py]` | Stdlib-only build-plan IR validator: required fields, units enum, per-number unit+frame, primitive XOR operation, C3 penetration on union joins, C6 profile-on-axis, scale well-formedness, C5 confidence routing, bbox sanity; `--resolve` expands `value_ref`/`support`/`array` constructs into a literal IR (relational-IR by construction, so attach points are computed not hand-typed). Exits non-zero on failure. |
 
 ## image-to-model/ — image producer
 
@@ -74,9 +74,10 @@ Every file in the tree with a one-line purpose. Paths are relative to the repo r
 |------|---------|
 | `rhino-scene-state/SKILL.md` | Knowledge entry point: the GUID-ledger protocol (C1 capture-at-bake, three-way identity, GUID-first/UserString-fallback/Name-last resolution, boolean-consumes-inputs `child_of`), the capture-before/after reconcile loop (C2/C3), and token-economy enforcement. |
 | `rhino-scene-state/reference/scene-graph.md` | Artifact-format reference: top-level shape, nodes as the combined `part_id→GUID` + bbox/dims ledger, realized-relation edges, re-read-each-step discipline, and the strict resolve() order with a runnable snippet. |
-| `rhino-scene-state/schema/scene-graph.schema.json` `[json]` | JSON Schema (draft 2020-12) for the scene-graph artifact: requires object/units/tolerance/nodes; node requires bbox + anyOf guid|part_id; edge requires type/from/to with an interpenetrate→penetration conditional; `additionalProperties:false`. |
-| `rhino-scene-state/scripts/reconcile.py` `[py]` | Diffs expected scene-graph vs actual document summary; matches GUID-first then part_id then Name; flags MISSING (honoring `child_of` consumption), EXTRA, MIS-SIZED, and post-boolean COUNT+VOLUME mismatch (C2). `--stage <id>` scopes the diff to one build stage (conventions §12) so a re-emitted stage is verified without the rest of the model. Exits non-zero on any mismatch. |
-| `rhino-scene-state/scripts/stage_emit.py` `[py]` | Emits the scoped-idempotent STAGE preamble for `execute_rhinoscript_python_code` (conventions §12): a `purge_stage()` that deletes only the live objects tagged with this `stage` (or in a `part_id` allow-list / layer scope), then the post-purge `_stage_before_ids` snapshot for the create-then-find-newest shim. Makes a re-run (incl. double-execution, E1) converge to one copy of the stage and bounds an op failure to its stage (E5/E10). |
+| `rhino-scene-state/schema/scene-graph.schema.json` `[json]` | JSON Schema (draft 2020-12) for the scene-graph artifact: requires object/units/tolerance/nodes; node requires bbox + anyOf guid|part_id; edge requires type/from/to with an interpenetrate→penetration conditional; per-node optional `obb`/`centroid` oriented handles and per-checkpoint `connectivity[]` verdicts (C9/§13); `additionalProperties:false`. |
+| `rhino-scene-state/scripts/reconcile.py` `[py]` | Diffs expected scene-graph vs actual document summary; matches GUID-first then part_id then Name; flags MISSING (honoring `child_of` consumption), EXTRA, MIS-SIZED, and post-boolean COUNT+VOLUME mismatch (C2). `--stage <id>` scopes the diff to one build stage (conventions §12) so a re-emitted stage is verified without the rest of the model; also maintains cross-stage CONNECTIVITY checkpoints (C1/C2 of §13): re-emitting a stage invalidates the connectivity of every stage whose relations cross into it, and a purged stage's dangling edges are flagged UNCOVERED. Exits non-zero on any mismatch. |
+| `rhino-scene-state/scripts/stage_emit.py` `[py]` | Emits the scoped-idempotent STAGE preamble for `execute_rhinoscript_python_code` (conventions §12): a `purge_stage()` that deletes only the live objects tagged with this `stage` (or in a `part_id` allow-list / layer scope), then the post-purge `_stage_before_ids` snapshot for the create-then-find-newest shim. Makes a re-run (incl. double-execution, E1) converge to one copy of the stage and bounds an op failure to its stage (E5/E10). With `--connectivity-edges` it also appends the batched per-stage CONNECTIVITY SWEEP (C9/§13): one in-Rhino pass that measures realized `Brep.ClosestPoint` gaps between live solids by GUID (A1) and prints only violations (B1) as the `--actual` input to `check_connectivity.py`. |
+| `rhino-scene-state/scripts/check_connectivity.py` `[py]` | DETECT+ENFORCE inter-part connectivity (C9/§13): classifies every declared contact relation against the realized in-Rhino gaps, applies the per-relation-type tolerance band (A3), enforces the completeness clause (`UNCOVERED`=FAIL; `floating:true` exempt, F), supports `--stage` scoping (B3) and `--recheck` array-family sampling (B2). Consumes the GUID-to-GUID gap report (A1); never derives a gap from a bbox (A2). Exits non-zero on any out_of_band or uncovered. |
 
 ## render-and-look/ — perception / verify
 

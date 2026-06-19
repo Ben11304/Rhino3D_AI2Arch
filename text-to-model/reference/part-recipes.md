@@ -194,6 +194,152 @@ straight distance. Ideal for prismatic brackets, slab floors, and extruded build
 
 ---
 
+## Recipe 5 — Relational construction (the PREVENT leg of connectivity, §13/C9)
+
+The dominant real-session failure was **connectivity**: balusters that did not reach a rising
+helical handrail, columns floating above the floor, arches not seated on column tops — every one
+caught by a human *by eye*. The fix has three legs (conventions
+[§13](../../shared/conventions.md)): **PREVENT** (build the attach geometry to the *correct literal*),
+**DETECT** (`check_connectivity` measures the realized solid-to-solid gap), **ENFORCE**
+(`UNCOVERED = FAIL`). This recipe is the **PREVENT** leg — it lets the IR *publish* a support and
+*reference* it, instead of guessing a coordinate.
+
+Three new IR constructs make this work; `validate_plan.py --resolve` folds them into a plain-literal
+IR **before** any geometry is emitted (and the literal IR re-validates):
+
+- **`support`** (per part): a level/law a part PUBLISHES for others to attach to. A floor publishes
+  `{kind:"plane_z", value:0}`; a rising helical rail publishes
+  `{kind:"helix_z", helix:{base_z, pitch, radius, start_angle}}`. The helix law is
+  `Z(theta_deg) = base_z + pitch*((theta - start_angle)/360)`.
+- **`value_ref`** (any numeric: dims/height/thickness/penetration/frame.origin/tol): a NON-literal
+  number resolved at codegen — `{param:"name"}`, `{op:"+|-|*|/", args:[...]}` (folded left-to-right;
+  `args[0]` is the minuend/numerator), or `{part:"id", of:"top_z|base_z|z_at_angle|z|centroid_z",
+  at?:deg}` reading a coordinate **published by another part's `support`**.
+- **`array`** (per part): declares ONE part as a FAMILY of `count` instances
+  (`radial`/`helical`/`linear`); the resolver expands it to concrete parts `<id>#<i>` (0-based).
+  Inside an array part a value_ref may read the **reserved params** `__angle__` (this instance's
+  array angle, degrees) and `__i__` (this instance's 0-based index), so each member can resolve its
+  own attach height.
+
+> The resolver turns these into literals: run
+> `python3 scripts/validate_plan.py <plan>.json --resolve --out resolved.json`. A cycle in the
+> value_ref DAG is an ERROR; an unknown param/part, a division by zero, or a non-finite result is an
+> ERROR. The emitted `resolved.json` has **no** value_refs/arrays left and validates with the same
+> validator — that literal IR is what the connectivity sweep (§13 DETECT) later measures against.
+
+### 5a — Helical baluster family landing on a rising rail (the exact stair case)
+
+The rail publishes its helix law; each baluster reads the rail's `z_at_angle` at **its own** array
+angle, so its top is built to reach the rail (no guessed length). A `lands_on` relation with
+`at_surface:"realized"` makes the curved support measured by realized distance (A4), not a face label.
+
+```json
+{
+  "params": { "rail_base_z": 900, "rail_pitch": 600, "rail_radius": 1500,
+              "post_base_z": 0, "baluster_radius": 12 },
+  "parts": [
+    { "id": "rail", "primitive": "cylinder",
+      "frame": { "plane": "WorldXY", "origin": [1500, 0, 900] },
+      "dims": { "radius": 30, "height": 50 },
+      "support": { "kind": "helix_z",
+        "helix": { "base_z": { "param": "rail_base_z" }, "pitch": { "param": "rail_pitch" },
+                   "radius": { "param": "rail_radius" }, "start_angle": 0 } } },
+
+    { "id": "baluster", "primitive": "cylinder",
+      "frame": { "plane": "WorldXY", "origin": [0, 0, { "param": "post_base_z" }] },
+      "dims": { "radius": { "param": "baluster_radius" },
+        "height": { "op": "-", "args": [
+            { "part": "rail", "of": "z_at_angle", "at": { "param": "__angle__" } },
+            { "param": "post_base_z" } ] } },
+      "array": { "kind": "helical", "axis": "WorldZ", "count": 5,
+        "radius": { "param": "rail_radius" }, "angle_step": 18,
+        "pitch": { "param": "rail_pitch" }, "start_angle": 0 },
+      "relations": [ { "type": "lands_on", "to": "rail", "at_surface": "realized" } ] }
+  ]
+}
+```
+
+`--resolve` expands `baluster` into `baluster#0..#4` on the helix (plan radius 1500, rising
+`z_step = pitch*angle_step/360 = 30 mm` per step) with **per-instance** heights computed from the
+rail's helix law: `900, 930, 960, 990, 1020` at angles `0,18,36,54,72`. No baluster is the same
+length — exactly what stops the "balusters do not reach the rising rail" defect. The
+[`examples/chair.json`](../examples/chair.json) leg height is the same idea in miniature:
+`height := seat.base_z - floor.top_z + join_penetration`.
+
+### Tool sequence (5a)
+
+1. Build `rail` (typed `create_object` / pipe along a helix curve); stamp `UserString part_id="rail"`,
+   register `rail -> GUID`. Pin its published support height with the §5a DIRECTION-PIN idiom so the
+   support level is *where the geometry actually is*.
+2. For each resolved `baluster#i` (the IR is already literal): `create_object` type=`CYLINDER` on its
+   frame; stamp `UserString part_id="baluster#i"`; register each GUID.
+3. **DETECT (§13):** run the per-stage connectivity sweep — ONE `execute_rhinoscript_python_code`
+   that loops this stage's edges, measures `realized_gap(rail_GUID, baluster#i_GUID)` for each (sample
+   first/middle/last + flagged on re-emit, full N on initial bake, B2), and returns only the
+   `out_of_band`/`uncovered` violations. A `lands_on` band is `[-penetration, +tol]`.
+
+### 5b — Columns landing on a stylobate floor
+
+The floor publishes a flat `plane_z`; every column's base resolves to it and `lands_on` it. A
+`linear` array lays the colonnade out at a fixed bay spacing.
+
+```json
+{
+  "params": { "floor_top": 0, "col_radius": 150, "col_height": 4200, "bay": 1800 },
+  "parts": [
+    { "id": "stylobate", "primitive": "box",
+      "frame": { "plane": "WorldXY", "origin": [0, 0, -150] },
+      "dims": { "x": 12000, "y": 2000, "z": 300 },
+      "support": { "kind": "plane_z", "value": { "param": "floor_top" } } },
+
+    { "id": "column", "primitive": "cylinder",
+      "frame": { "plane": "WorldXY", "origin": [-3600, 0, { "part": "stylobate", "of": "top_z" }] },
+      "dims": { "radius": { "param": "col_radius" }, "height": { "param": "col_height" } },
+      "array": { "kind": "linear", "count": 5, "step": [{ "param": "bay" }, 0, 0] },
+      "support": { "kind": "top_z",
+        "value": { "op": "+", "args": [ { "param": "floor_top" }, { "param": "col_height" } ] } },
+      "relations": [ { "type": "lands_on", "to": "stylobate", "at_surface": "top" } ] }
+  ]
+}
+```
+
+The column base z is `stylobate.top_z` (0), so it is built **on** the floor, not floating above it.
+Each column also PUBLISHES its own `top_z` (`floor_top + col_height = 4200`) so the arch course above
+can attach to it (5c). `--resolve` produces `column#0..#4` at x `-3600, -1800, 0, 1800, 3600`, each
+with base on the floor.
+
+### 5c — Arches spanning_between adjacent column tops
+
+An arch is supported at BOTH ends by two columns; `spans_between` carries the two supports `to`
+(first) and `to2` (second), and the connectivity sweep measures the gap at **both** endpoints.
+
+```json
+{
+  "parts": [
+    { "id": "arch_0", "operation": "sweep1", "rail": "arch_rail_0", "sections": ["arch_sec_a", "arch_sec_b"],
+      "relations": [ { "type": "spans_between", "to": "column#0", "to2": "column#1", "at_surface": "realized" } ] },
+    { "id": "arch_1", "operation": "sweep1", "rail": "arch_rail_1", "sections": ["arch_sec_a", "arch_sec_b"],
+      "relations": [ { "type": "spans_between", "to": "column#1", "to2": "column#2", "at_surface": "realized" } ] }
+  ]
+}
+```
+
+The arch springing height resolves from the columns' published `top_z` (e.g. the arch rail's start/end
+control points sit at `{ "part": "column#0", "of": "top_z" }`), so the arch lands **on** the column
+tops. The `spans_between` edge is keyed by part_id (`column#0`/`column#1`), so re-baking a column
+(changing its GUID, not its id) invalidates the arch's connectivity checkpoint (C1) and the sweep
+re-measures both endpoints. A finial or pendant boss that is *meant* to hang free carries
+`floating: true` so it is exempt from the completeness clause (F) and never raises a false
+`UNCOVERED`.
+
+> **Why this is not circular (A1):** the `value_ref`/`support` machinery only *builds* the geometry
+> to the right place (PREVENT). The connectivity sweep (§13 DETECT) never trusts the IR coordinate — it
+> measures the realized gap between the two **live solids by GUID**, so a wrong support still gets
+> caught. PREVENT reduces failures; DETECT proves it; ENFORCE (`UNCOVERED = FAIL`) makes silence
+> impossible.
+
+---
+
 ## Cross-cutting checklist (applies to every recipe)
 
 - Author on `Plane.WorldXY`, relocate via `Transform.PlaneToPlane` (conventions §4) — never bake
@@ -207,3 +353,8 @@ straight distance. Ideal for prismatic brackets, slab floors, and extruded build
   reserved for *"does it look like X"* (C4). Color each part before `capture_viewport`.
 - Run `scripts/validate_plan.py <plan>.json` **before** emitting any geometry; it exits non-zero on
   the first structural defect with a verbose, frame-aware message.
+- When a plan uses relational constructs (`value_ref`/`support`/`array`), run
+  `scripts/validate_plan.py <plan>.json --resolve --out resolved.json` to fold them into a
+  plain-literal IR (PREVENT, §13). Emit geometry from the **resolved** IR; a cycle, unknown
+  param/part, or division by zero is an ERROR there. Then DETECT with the per-stage connectivity
+  sweep and ENFORCE the completeness clause (`UNCOVERED = FAIL`).

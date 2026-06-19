@@ -18,6 +18,7 @@ to **measure-verify** (`rhino-scene-state`). Vision keeps only shape/likeness/re
 | How many legs / solids / holes (a count)             | **measure-verify** (`solid_count`) | counting in a render is unreliable; bbox/analyze is exact |
 | Seat height / overall height / any length in mm/cm   | **measure-verify** (`numeric_checks`) | vision cannot read absolute size (C4) |
 | Distance / gap / offset between two parts            | **measure-verify** (`numeric_checks`) | measurable → math |
+| Realized gap where two parts must touch (connectivity) | **measure-verify** (`rhino-scene-state` §13/C9 sweep) | the realized solid-to-solid gap is the authoritative verdict; vision is advisory only (see §6) |
 | Symmetry *offset* equal on both sides (a number)     | **measure-verify** (`ratio_checks`) | measurable → math |
 | Total volume / does a boolean keep volume            | **measure-verify** (`total_volume`) | partial-boolean guard is numeric (C2) |
 | Angle of a taper / tilt in degrees                   | **measure-verify** (`numeric_checks`) | measurable → math |
@@ -62,6 +63,15 @@ distinctive profile, author **one** shape-fidelity question. Name the part by it
 For a `mirror` symmetry: "does the left half visually mirror the right half?" For `rotational`
 with `count`: "are the <count> arms evenly spaced around the center?" (qualitative even-ness only —
 the *measured* spacing is measure-verify's `ratio_checks`).
+
+### Source E — contact `relations` → one SOFT, advisory-only connectivity question (NEVER fails the build)
+For a contact relation in the IR (`on_top_of`, `lands_on`, `meets`, `spans`, `spans_between`,
+`coincident`, `interpenetrate` — conventions §13/C9), author **one** colored "do they look joined?"
+question, e.g. "do the **red** balusters look joined to the **blue** rail where they meet?",
+"does the **green** column look seated on the **yellow** floor (no floating gap)?", "does the
+**orange** arch look to rest on the **violet** column top?". This is the **lowest-priority** source
+and is strictly **ADVISORY** — see §6. It exists only to give a human-legible heads-up alongside the
+numeric verdict; it is **never** the source of a repair item by itself.
 
 ### Phrasing constraints (enforce on every emitted question)
 - Names a **color** or a **relative relation** (above/below, inside/outside, left/right), never an
@@ -169,3 +179,41 @@ A JSON differential repair list of failed vision items only:
 An **empty list** means all vision checks passed. The orchestrator routes this to `rhino-repair`,
 which enforces the per-item + global repair budget (C8, conventions §10). This skill never mutates
 geometry and never measures — measurement is measure-verify's (`rhino-scene-state`) job.
+
+---
+
+## 6. The connectivity vision question is SOFT / ADVISORY ONLY (C4 vision-demotion preserved)
+
+Connectivity — "do the two parts actually touch where they must?" — is a **measurable gap**, so by the
+vision-demotion rule (C4) the **authoritative** verdict is the numeric realized solid-to-solid sweep
+owned by `rhino-scene-state` (conventions §13/C9): the per-stage `check_connectivity` sweep measures
+the gap by GUID and judges it against the per-relation-type band. Vision **cannot** read a 12 mm gap
+reliably, so the Source-E "do the red and blue parts look joined?" question is kept deliberately weak:
+
+- **It can NEVER fail the build.** A `no`/`unclear` on a Source-E connectivity question does **NOT**
+  emit a repair item and does **NOT** gate the stage. Only the numeric C9 verdict (`out_of_band` /
+  `uncovered`) can fail connectivity. This preserves C4: a number-answerable judgment is never decided
+  by squinting at a render.
+- **Its only job is corroboration.** Report the Source-E answer **separately**, as an advisory note
+  attached to the stage, so a human reading the report sees the eye-check next to the authoritative
+  number. If vision says "looks joined" but the numeric sweep says `out_of_band`, **the numeric verdict
+  wins** and the stage fails; if vision says "looks gappy" but the sweep says green, the build still
+  passes (the advisory note is surfaced for a human sanity-check, but it cannot override the measurement).
+- **Output channel is separate from the repair list.** Source-E answers go in an `advisory` block,
+  never in the §5 differential repair list, so they can never become repair items:
+
+```json
+{
+  "repairs": [ /* §5 vision repair items — Source A–D, these DO drive repair */ ],
+  "advisory": [
+    { "relation": "lands_on", "from": "baluster_7", "to": "rail",
+      "question": "do the red balusters look joined to the blue rail where they meet?",
+      "verdict": "unclear",
+      "note": "ADVISORY ONLY — authoritative verdict is rhino-scene-state §13/C9 numeric sweep; this never fails the build" }
+  ]
+}
+```
+
+The orchestrator treats `advisory[]` as a human-readable corroboration of the §13 sweep, not as a gate.
+This is the vision side of the triad: PREVENT and ENFORCE are numeric; DETECT is numeric (the §13
+sweep); vision only *advises*.

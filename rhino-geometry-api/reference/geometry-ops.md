@@ -165,6 +165,19 @@ brep = extr.ToBrep() if extr else None
 `Surface.CreateExtrusion` returns an open surface; for a capped solid use
 `Extrusion.Create(curve, height, cap=True)` with a **closed, planar** profile.
 
+**DIRECTION-PIN (E3 — silent wrong-Z; conventions [§5a](../../shared/conventions.md#5a-the-direction-pin-idiom-every-directional-op)).**
+`Extrusion.Create` / `Surface.CreateExtrusion` (and `RevSurface.Create` /
+`Brep.CreateFromRevSurface`) extrude/revolve **along the curve's own
+normal/tangent, which is NOT trustworthy** — a profile authored on `WorldXZ` can
+extrude in `−Z`, so a seat meant to top out at 450 lands at 410 and the *count*
+still passes. After **any** directional create you MUST read
+`brep.GetBoundingBox(True)` and PIN the intended face (top/bottom) onto the
+IR-intended Z by `brep.Transform(Transform.Translation(Vector3d(0,0,dz)))`, then
+re-read the bbox to **confirm** the pin took. The published `support` level a part
+exposes is the *pinned* value. `codegen_guard.py` **RULE 10** fails any snippet
+that calls a directional op without a `GetBoundingBox(` read plus a `.Max.Z`/
+`.Min.Z` anchor paired with `Transform.Translation`/`.Translate()`.
+
 **Pre-flight inputs (C7):**
 - For a capped solid the profile MUST be **closed** (`curve.IsClosed`) and
   **planar** (`curve.IsPlanar(tol)`). Open or non-planar ⇒ no cap ⇒ not solid.
@@ -331,6 +344,39 @@ There is **no typed MCP tool** for network surface — emit it via
   intersecting families; trim/extend curves so they actually cross within tol.
 - Lumpy surface → mismatched curve counts/degrees → rebuild curves to consistent
   degree before the network call.
+
+---
+
+## Method availability + fallback (E4 — missing method, DEGRADE VISIBLY)
+
+Some RhinoCommon members are **not present in every Rhino build** (the version on
+the connected machine decides), and a few have an *overload* that exists in the
+docs but not in the running assembly. Calling a missing member raises an
+`AttributeError`/`MissingMethodException` inside `execute_rhinoscript_python_code`
+that reads like an unrelated geometry failure. **Probe first**, then fall back —
+and tag the degraded result `shell_degraded:true` so the loss of fidelity is
+**visible**, never silently rolled back.
+
+**Probe the build before relying on a fragile member** with
+[`../../rhino-modeling/scripts/detect_server.py --rhinocommon-probe`](../../rhino-modeling/scripts/detect_server.py),
+which emits a `hasattr`-based RhinoCommon snippet to send through
+`execute_rhinoscript_python_code`; it prints a capability map
+(`{label: {present, owner, member, degraded_fallback}}`). A `present:false` entry
+means take the fallback below.
+
+| Fragile member | Probe label | If MISSING → fallback (tag `shell_degraded:true`) |
+|----------------|-------------|---------------------------------------------------|
+| `Brep.CreateOffset` (shell) | `brep_create_offset` | **Loft between the inner and outer profiles** (offset the section curve inward by `thickness`, then `Brep.CreateFromLoft` outer→inner and cap), or build the wall as a manual two-shell solid. Wall thickness is approximate ⇒ `shell_degraded:true`. |
+| `Brep.CreateOffset` solid overload `(brep, dist, solid, extend, tol)` | `brep_create_offset_solid_overload` | `hasattr` can be `True` while this overload is absent. Wrap the call in `try/except (TypeError, Exception)`; on failure fall back to the manual two-shell loft above and tag `shell_degraded:true`. |
+| `RevSurface.Create` | `rev_surface_create` | **Sweep the profile on a circular rail** (`Brep.CreateFromSweep` with a full-circle rail) or `Brep.CreatePipe` for a tube approximation, then cap. Section fidelity is approximate ⇒ `shell_degraded:true`. |
+| `NurbsSurface.CreateNetworkSurface` | `nurbs_network_surface` | **`Brep.CreateFromLoft` across the U-family then trim**, or `Brep.CreatePatch` through the grid points. Surface is an approximation of the network ⇒ `shell_degraded:true`. |
+
+`shell_degraded:true` belongs on the part's node in the scene-graph (alongside its
+GUID) so verification and the user both see that the op produced a *degraded*
+solid rather than the intended one — the op DEGRADES VISIBLY instead of the whole
+stage rolling back. See
+[`../../rhino-modeling/reference/server-capabilities.md`](../../rhino-modeling/reference/server-capabilities.md)
+for how the probe + capability map are surfaced.
 
 ---
 

@@ -61,7 +61,17 @@
             "description": "passed = this stage baked and reconciled clean; failed = reconcile flagged a defect not yet repaired; pending = declared but not yet built."
           },
           "revision": { "type": "integer", "minimum": 0, "description": "scene-graph revision at which this stage last reached 'status'. The .3dm was saved at this revision (E11)." },
-          "part_ids": { "type": "array", "items": { "type": "string" }, "description": "Part ids this checkpoint covers (the stage's parts), so a re-emit knows exactly what to purge + rebuild." }
+          "part_ids": { "type": "array", "items": { "type": "string" }, "description": "Part ids this checkpoint covers (the stage's parts), so a re-emit knows exactly what to purge + rebuild." },
+          "connectivity": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/connectivity_entry" },
+            "description": "Realized connectivity results for the edges in this stage's scope (§13/C9). Produced by the per-stage sweep (B1) which evaluates only relations whose endpoints are in current/closed stages (B3). A checkpoint with ANY entry of status 'out_of_band' or 'uncovered' for a non-floating edge MUST NOT be marked status='passed' — that is the clause defeating false confidence. Per B1 the sweep returns only violations; passing entries are optional here. Per C2 a pre-purge referential check adds an 'uncovered' entry for every edge pointing at a now-deleted part_id rather than silently passing by omission."
+          },
+          "connectivity_status": {
+            "type": "string",
+            "enum": ["green", "violations", "not_run"],
+            "description": "Roll-up of this stage's connectivity sweep: green = every in-scope non-floating edge measured and in-band; violations = at least one out_of_band or uncovered entry => the stage is NOT done; not_run = the sweep has not executed for this revision (e.g. a re-emit of a crossing stage invalidated it per §13/C1 and it must re-run before the stage is green again)."
+          }
         }
       }
     }
@@ -78,10 +88,28 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["min", "max"],
-      "description": "World-axis-aligned bounding box captured from the baked geometry via Rhino.Geometry.BoundingBox (GetBoundingBox(True)). min and max are opposite corners in 'units'.",
+      "description": "World-axis-aligned bounding box captured from the baked geometry via Rhino.Geometry.BoundingBox (GetBoundingBox(True)). min and max are opposite corners in 'units'. UNSOUND as a proximity handle for helical/rotated parts: two far-apart helix points can have touching AABBs, so connectivity (§13/A2) must use 'obb'/'centroid' and realized solid-to-solid measurement, never AABB arithmetic, for non-axis-aligned relations.",
       "properties": {
         "min": { "$ref": "#/$defs/point3d", "description": "Minimum corner [x,y,z]." },
         "max": { "$ref": "#/$defs/point3d", "description": "Maximum corner [x,y,z]." }
+      }
+    },
+    "obb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "x_axis", "y_axis", "extents"],
+      "description": "Oriented bounding box captured at bake time (the A2 oriented handle). Unlike the world-AABB this travels with the part's own frame, so it is a SOUND proximity handle for helical/rotated/curved members where the AABB is misleading. Captured via Rhino.Geometry.Brep.GetBoundingBox(plane) on the part's construction Plane (origin + x_axis + y_axis define the box plane; z_axis is x_axis cross y_axis). The connectivity sweep (§13) uses this and 'centroid' for orientation/coarse culling, then the realized solid-to-solid measurement (A1/A4) for the actual gap.",
+      "properties": {
+        "origin": { "$ref": "#/$defs/point3d", "description": "Box plane origin [x,y,z] in 'units' against world_frame." },
+        "x_axis": { "$ref": "#/$defs/point3d", "description": "Unit X axis of the box plane." },
+        "y_axis": { "$ref": "#/$defs/point3d", "description": "Unit Y axis of the box plane (z_axis = x_axis x y_axis)." },
+        "extents": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 },
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "Half-or-full extents [ex,ey,ez] along the box plane axes, in 'units' (full edge lengths; the executor that writes this records which convention it used consistently)."
+        }
       }
     },
     "frame": {
@@ -136,7 +164,10 @@
           "description": "How the geometry was produced: a primitive type ('box','cylinder','sphere','cone','plane','interpolated_curve') or an operation result ('loft','sweep1','revolve','extrude','shell','boolean'). Free-form to allow operation results."
         },
         "frame": { "$ref": "#/$defs/frame", "description": "Local construction frame the part was authored on (copied from the IR)." },
-        "bbox": { "$ref": "#/$defs/bbox", "description": "World-axis-aligned bounding box captured from the live baked geometry." },
+        "bbox": { "$ref": "#/$defs/bbox", "description": "World-axis-aligned bounding box captured from the live baked geometry. NOT a proximity handle for non-axis-aligned parts; see 'obb' (A2)." },
+        "obb": { "$ref": "#/$defs/obb", "description": "Oriented bounding box captured at bake time (A2). REQUIRED-IN-PRACTICE for any helical/rotated/curved member so the connectivity sweep (§13) has a sound oriented handle and never falls back to AABB arithmetic for that part's relations." },
+        "centroid": { "$ref": "#/$defs/point3d", "description": "Realized solid/area centroid [x,y,z] in 'units' (VolumeMassProperties.Compute(...).Centroid, or AreaMassProperties for open geometry), captured at bake time (A2). A stable single-point handle for orientation/coarse culling in the connectivity sweep; the actual gap is still measured solid-to-solid (A1)." },
+        "contact_point": { "$ref": "#/$defs/point3d", "description": "Optional realized attach point [x,y,z] in 'units' captured at bake time for a curved/helical support (A2/A4): the point on THIS part's realized solid nearest the support it lands on/meets, so a re-emit can re-key the same contact. Informational; the §13 sweep still re-measures live solid-to-solid by GUID (A1) rather than trusting this stored point." },
         "dims": {
           "type": "object",
           "description": "Key realized dimensions in 'units', e.g. {x,y,z} for a box, {radius,height} for a cylinder, or {width,depth,height} derived from the bbox. Used by reconcile MIS-SIZED checks.",
@@ -170,22 +201,41 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "from", "to"],
-      "description": "A realized relation between two nodes, mirroring an IR relation. For 'interpenetrate' edges (union joins) the realized overlap depth is recorded in 'penetration' for the correction-C3 check.",
+      "description": "A realized relation between two nodes, mirroring an IR relation. Edges are keyed by 'from'/'to' part_id ONLY, NEVER by GUID (C1): a re-bake gives a part a new GUID but the same part_id, so part_id-keyed edges survive a re-emit and let the cross-stage invalidation (§13/C1) find every edge crossing into a re-emitted stage. For 'interpenetrate' edges (union joins) the realized overlap depth is recorded in 'penetration' for the correction-C3 check. The measured gap and its pass/out_of_band/uncovered status live in the per-checkpoint 'connectivity' section, not on the edge.",
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate"],
-          "description": "Relation kind. 'child_of' models an operation result owning its consumed inputs; 'interpenetrate' models a union join overlap."
+          "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate", "lands_on", "meets", "spans", "spans_between"],
+          "description": "Relation kind, mirroring the IR relation enum. 'child_of' models an operation result owning its consumed inputs; 'interpenetrate' models a union join overlap; lands_on/meets/spans/spans_between are measured contact obligations (§13/A3)."
         },
         "from": {
           "type": "string",
           "minLength": 1,
-          "description": "part_id of the node this relation is anchored on."
+          "description": "part_id of the node this relation is anchored on (NEVER a GUID, C1). For an array family member, the instance id '<id>#<i>'."
         },
         "to": {
           "type": "string",
           "minLength": 1,
-          "description": "part_id of the other node, or a symmetry/frame name for 'symmetric_about'."
+          "description": "part_id of the other node (NEVER a GUID, C1), or a symmetry/frame name for 'symmetric_about'. For 'spans_between' this is the first support; the second is 'to2'."
+        },
+        "to2": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Second support part_id for type='spans_between' (the part is supported at both endpoints; both gaps are measured)."
+        },
+        "at_surface": {
+          "type": "string",
+          "enum": ["top", "bottom", "nearest", "centerline", "realized"],
+          "description": "Mirrors the IR relation.at_surface: WHERE on 'to' the gap was measured (A3/A4). 'realized' for curved/helical supports means solid-to-solid MinDistanceBetween, never a face label."
+        },
+        "tol": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Per-edge acceptance band half-width in 'units' (resolved from the IR relation.tol, or the document tolerance when absent). The §13 connectivity sweep applies it per the relation type's band (A3)."
+        },
+        "floating": {
+          "type": "boolean",
+          "description": "Mirrors the floating opt-out (F): when the 'from' node is intended to float, this edge is informational and does NOT participate in the completeness clause (no UNCOVERED pressure)."
         },
         "penetration": {
           "type": "number",
@@ -197,8 +247,58 @@
         {
           "if": { "properties": { "type": { "const": "interpenetrate" } } },
           "then": { "required": ["penetration"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "spans_between" } } },
+          "then": { "required": ["to2"] }
         }
       ]
+    },
+    "connectivity_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["edge", "status"],
+      "description": "One realized connectivity measurement produced by the §13/C9 sweep for a single edge in a checkpoint's stage scope. The sweep is ONE execute_rhinoscript_python_code call per stage that loops the stage's declared edges, measures each realized solid-to-solid gap by GUID (A1/A4), and records the result here. Per B1 the in-Rhino sweep returns only VIOLATIONS (out_of_band + uncovered) as compact JSON; rhino-scene-state may persist passing entries too, but a stage is GREEN only when this list contains no out_of_band and no uncovered entry for any non-floating edge.",
+      "properties": {
+        "edge": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "from", "to"],
+          "description": "The edge this measurement is for, identified by part_id (C1), echoing type/from/to (+to2 for spans_between).",
+          "properties": {
+            "type": { "type": "string", "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate", "lands_on", "meets", "spans", "spans_between"] },
+            "from": { "type": "string", "minLength": 1 },
+            "to": { "type": "string", "minLength": 1 },
+            "to2": { "type": "string", "minLength": 1, "description": "Second support part_id for spans_between." }
+          }
+        },
+        "gap": {
+          "type": "number",
+          "description": "Realized signed gap in 'units' between the two LIVE solids (A1): positive = a real space between them; negative = interpenetration depth. Measured via Brep.ClosestPoint / Brep MinDistanceBetween read live by GUID from the document (NEVER against an IR-derived probe point, A1). For curved/helical supports it is the nearest-point-on-realized-solid distance (A4). Omitted when status='uncovered' (no measurement was possible)."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "out_of_band", "uncovered"],
+          "description": "pass = realized gap is inside this relation type's band (A3). out_of_band = measured but outside the band (e.g. a baluster 12mm short of the rail, or a column floating above the floor) => FAIL. uncovered = a declared contact with NO measurement, or a non-floating assembly part with NO declared+measured contact, or an edge pointing at a now-deleted part_id (C2) => FAIL. uncovered is THE clause that makes 'declared success with gaps' impossible (§13/C9 completeness)."
+        },
+        "measured_between": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[guidA, guidB] of the two LIVE objects the gap was measured between (A1). Recording the GUIDs proves the measurement was solid-to-solid against the document, not against an IR coordinate. Omitted when status='uncovered' (one side has no live GUID)."
+        },
+        "band": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[lo, hi] the per-relation-type acceptance band actually applied (A3), in 'units', for the report (e.g. on_top_of => [0, +tol]; interpenetrate => [-2,-0.5]). Informational."
+        }
+      }
     }
   }
 }

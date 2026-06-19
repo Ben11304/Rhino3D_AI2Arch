@@ -228,6 +228,44 @@ sc.doc.Views.Redraw()
 print(guid)                                   # only stdout enters context
 ```
 
+### 5a. The DIRECTION-PIN idiom (every directional op)
+
+A directional constructor — `Extrusion.Create`, `Surface.CreateExtrusion`,
+`RevSurface.Create`, `Brep.CreateFromRevSurface`, `Curve.CreateExtrusion` — extrudes/revolves
+**along the curve's own normal/tangent direction, which is NOT trustworthy.** A profile authored
+on `WorldXZ` can extrude in `-Z` instead of `+Z`, so a seat meant to top out at 450 lands at 410
+and the *count* still passes. The realized "seat extruded to 410 not 450" defect came from exactly
+this: trusting the curve normal instead of pinning the result to the intended Z.
+
+**Rule: after any directional create, read `GetBoundingBox(True)` and PIN the result to the
+IR-intended Z** (translate so the intended face — top or bottom — sits exactly where the IR says),
+then re-read to confirm. Pin to the face the IR anchors on (`at_surface`), not the midpoint.
+
+```python
+#! python3
+import scriptcontext as sc
+import Rhino
+from Rhino.Geometry import Vector3d, Transform
+
+# brep is the freshly extruded/revolved result; the IR says its TOP must be at intended_top_z
+# (or its BASE at intended_base_z). Direction came out of the curve normal — do not trust it.
+bb = brep.GetBoundingBox(True)
+if anchor == "top":
+    dz = intended_top_z - bb.Max.Z        # move so the top lands on the intended plane
+elif anchor == "bottom":
+    dz = intended_base_z - bb.Min.Z       # move so the base lands on the intended plane
+else:
+    dz = intended_center_z - 0.5 * (bb.Min.Z + bb.Max.Z)
+if abs(dz) > sc.doc.ModelAbsoluteTolerance:
+    brep.Transform(Transform.Translation(Vector3d(0, 0, dz)))
+bb = brep.GetBoundingBox(True)            # re-read to CONFIRM the pin, never assume it took
+assert abs((bb.Max.Z if anchor == "top" else bb.Min.Z)
+           - (intended_top_z if anchor == "top" else intended_base_z)) <= sc.doc.ModelAbsoluteTolerance
+```
+
+The published `support` level (§13) a part exposes is the **pinned** value, so any part that attaches
+to it via a `value_ref` resolves to where the geometry *actually* is, not where the curve normal put it.
+
 ---
 
 ## 6. Interpenetration rule for booleans (correction C3)
@@ -418,3 +456,237 @@ reports another stage's parts as EXTRA.
 cheap, large enough that reconcile has a meaningful unit. Booleans must stay **within one stage**
 (their inputs and result share a stage) so a `child_of` consumption is never split across a stage
 boundary.
+
+### 12a. Sidecar persistence + resume
+
+There is **no dedicated MCP save tool** (correction D). Persistence is done by `execute_*` calling
+RhinoCommon directly: `sc.doc.WriteFile(path, opts)` (or `Rhino.RhinoDoc.ActiveDoc.SaveAs(path)`),
+which **returns a bool** — you must check it is `True` before writing any JSON ledger.
+
+**Sidecar layout.** State lives next to the `.3dm` in a sidecar directory:
+
+```
+<name>.3dm
+<name>.rhino-skills/
+  build-plan.json                 # the IR (intent)
+  scene-graph.json                # the realized ledger (latest revision)
+  checkpoints/
+    0001-base.json                # per-stage frozen checkpoint (status, revision, connectivity)
+    0002-shaft.json
+    ...
+```
+
+**Write ORDER is load-bearing — ledger AFTER geometry.** Geometry is the source of truth; the JSON
+is a hint. So: (1) `ok = sc.doc.WriteFile(...)`; (2) **only if `ok is True`**, write the JSON
+sidecar; (3) write each JSON file **atomically** with `tmp + os.replace` so a crash mid-write never
+leaves a half-written ledger. If `WriteFile` returns `False` (or you are uncertain it persisted),
+**do not** advance the checkpoint — flag it and stop, rather than recording a checkpoint the `.3dm`
+does not back.
+
+```python
+#! python3
+import scriptcontext as sc, os, json, tempfile
+
+def save_with_sidecar(dotrhino_path, sidecar_dir, scene_graph, checkpoint_obj, stage_name):
+    opts = sc.doc.CreateDefaultWriteOptions() if hasattr(sc.doc, "CreateDefaultWriteOptions") else None
+    ok = sc.doc.WriteFile(dotrhino_path, opts) if opts is not None else sc.doc.WriteFile(dotrhino_path)
+    if ok is not True:                          # D: confirm True BEFORE the sidecar
+        raise RuntimeError("WriteFile returned %r; NOT writing sidecar (geometry not persisted)" % (ok,))
+    os.makedirs(os.path.join(sidecar_dir, "checkpoints"), exist_ok=True)
+    _atomic_json(os.path.join(sidecar_dir, "scene-graph.json"), scene_graph)
+    n = checkpoint_obj["revision"]
+    _atomic_json(os.path.join(sidecar_dir, "checkpoints", "%04d-%s.json" % (n, stage_name)), checkpoint_obj)
+    return True
+
+def _atomic_json(path, obj):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+        os.replace(tmp, path)                   # atomic on POSIX + Windows
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+```
+
+**Resume (Phase 0.5).** A `.3dm` round-trip does **not** preserve `System.Guid`s, so the saved GUID
+in the sidecar is only a **hint**. On reopen, re-bind `part_id -> live GUID` from the **authoritative**
+`UserString "part_id"` stamped on each object (§2/§3), not from the saved GUID:
+
+```python
+#! python3
+import scriptcontext as sc, json
+
+def rebind_part_ids(saved_scene_graph_path):
+    """Phase 0.5: rebuild the GUID ledger from live UserStrings (authoritative)."""
+    live = {}
+    for o in sc.doc.Objects:
+        pid = o.Attributes.GetUserString("part_id")
+        if pid:
+            live[pid] = o.Id                    # part_id -> CURRENT guid (saved guid is just a hint)
+    sg = json.load(open(saved_scene_graph_path))
+    for node in sg.get("nodes", []):
+        pid = node.get("part_id")
+        if pid in live:
+            node["guid"] = str(live[pid])       # overwrite stale saved guid with the live one
+    return sg, live
+```
+
+Because edges are **part_id-keyed** (C1, §13), the connectivity ledger survives the round-trip
+unchanged; only the per-node `guid` is re-bound. After re-binding, a resumed build trusts each
+stage's last `checkpoints[]` entry (status + revision + connectivity_status) to know which stages are
+already good and which must re-emit.
+
+---
+
+## 13. Connectivity as a NUMERIC OBLIGATION (correction C9)
+
+The dominant observed failure was **false confidence**: the framework declared success while
+inter-part *connectivity* defects went uncaught — balusters not reaching a rising helical handrail,
+columns floating above the floor, arches not seated on column tops — and a human caught every one
+*by eye*. §1–§12 guarantee each part is individually well-formed (valid, solid, right count, right
+volume) but say **nothing about whether parts actually TOUCH where they must.** C9 closes that hole
+by turning every contact relation into a **measured numeric obligation** that a stage cannot pass
+without satisfying.
+
+**The triad — defense in depth, strict order.**
+1. **PREVENT** (Phase 3, relational-IR): attach geometry resolves to the *correct literal*. A
+   baluster's top is a `value_ref {part:"rail", of:"z_at_angle", at:θ}` reading the rail's
+   **published `support`** (§ schema `support`/`value_ref`), not a guessed number, so it is built to
+   reach the rail in the first place.
+2. **DETECT** (Phase 5/6, this section): `check_connectivity` measures the **realized** gap between
+   the two live solids and flags out-of-band / uncovered. Detection does **not** depend on the
+   resolver — it reads the document — so it stands alone even if PREVENT was wrong.
+3. **ENFORCE** (the completeness clause below): UNCOVERED = FAIL. This is the clause that makes
+   "declared success with gaps" *impossible*.
+
+**A1 — NO CIRCULAR PROBE. Measure the realized gap between two LIVE SOLIDS, by GUID.** The gap input
+is **two GUIDs**, resolved from the live document (via `part_id` → live GUID, §2). Measure with
+`Brep.ClosestPoint` / the realized solid-to-solid `MinDistanceBetween` (face-pair minimum). **NEVER**
+measure against a probe point whose coordinates come from the IR intent you are verifying — that just
+re-confirms the bug. The intent is what produced the (possibly wrong) geometry; only document-truth
+can catch it.
+
+```python
+#! python3
+import scriptcontext as sc, Rhino
+
+def realized_gap(guid_a, guid_b):
+    """Signed gap in model units between two LIVE breps (A1). + = real space, - = overlap.
+    Inputs are GUIDs read from the document, never IR coordinates."""
+    tol = sc.doc.ModelAbsoluteTolerance
+    ba = sc.doc.Objects.FindId(guid_a).Geometry      # live geometry, by GUID
+    bb = sc.doc.Objects.FindId(guid_b).Geometry
+    # If the realized solids overlap, the gap is NEGATIVE (penetration depth).
+    inter = Rhino.Geometry.Brep.CreateBooleanIntersection([ba], [bb], tol)
+    if inter and len(inter) > 0:
+        bbx = inter[0].GetBoundingBox(True)          # crude overlap depth from the intersection solid
+        return -min(bbx.Max.X - bbx.Min.X, bbx.Max.Y - bbx.Min.Y, bbx.Max.Z - bbx.Min.Z)
+    # Otherwise the positive gap is the nearest realized point on B from A and vice-versa.
+    return min(_closest(ba, bb), _closest(bb, ba))
+
+def _closest(src, tgt):
+    """Nearest realized distance from src's surface samples onto tgt's solid (Brep.ClosestPoint)."""
+    best = float("inf")
+    for v in src.Vertices:                           # vertices are exact realized points on src
+        ok, u, w, ci, n, dist = tgt.ClosestPoint(v.Location, 0.0)  # Brep.ClosestPoint -> nearest pt on tgt
+        if ok and dist < best:
+            best = dist
+    return best
+```
+
+`Brep.ClosestPoint(testPoint)` returns the nearest point on the *realized* solid, so the gap is read
+from document truth (A1). For curved/helical members (A4) sample edge points along the rail rather
+than only vertices so the nearest-arc-length point is found.
+
+**A2 — ORIENTED HANDLE, never AABB arithmetic for non-axis-aligned relations.** A world-AABB is
+*unsound* for helical/rotated parts: two far-apart points on a helix can have touching bounding boxes.
+The scene-graph node therefore carries an **`obb`** (oriented bbox: plane origin + x/y axes + extents)
+and/or **`centroid`/`contact_point`**, captured at bake time (scene-graph schema). `check_connectivity`
+uses these only for orientation and coarse culling and **must not** fall back to AABB arithmetic to
+decide a non-axis-aligned relation — the gap itself always comes from the realized solid-to-solid
+measurement (A1).
+
+**A3 — PER-RELATION-TYPE TOLERANCE (a directed band, not one symmetric ±tol).** The measured signed
+gap `g` is judged against a band chosen by the relation `type` (override the document tolerance with
+the relation's optional `tol`):
+
+| relation        | band on signed gap `g`         | meaning                                            |
+|-----------------|--------------------------------|----------------------------------------------------|
+| `on_top_of`     | `0 <= g <= +tol`               | rests on the surface; **any** penetration is a FAIL |
+| `coincident`    | `|g| <= tol`                   | faces flush                                        |
+| `lands_on`      | `-penetration <= g <= +tol`    | base reaches the support, may seat slightly in     |
+| `meets`         | `-penetration <= g <= +tol`    | two ends abut                                      |
+| `interpenetrate`| `-2 <= g <= -0.5` (mm; C3)     | union overlap **must be NEGATIVE** 0.5–2 mm        |
+| `spans`         | both endpoint gaps in band     | bridges to its support at both ends                |
+| `spans_between` | both endpoint gaps in band     | supported at `to` **and** `to2`                    |
+
+A `+12 mm` gap on a `lands_on` (column floating above the floor) and a `-3 mm` gap on an `on_top_of`
+(arch sunk into the column) are **both** `out_of_band` = FAIL.
+
+**A4 — CURVED SUPPORTS by realized nearest-point, not a face label.** "Top of a helical rail" is a
+**Z-at-arc-length**, not a face you can name. For any curved/helical/rotated support set the relation
+`at_surface: "realized"`; the gap is then the distance to the **nearest point on B's realized solid**
+(the A1 measurement), so curved and helical supports are handled by realized distance, never a scalar
+face height. The rail's published `support.helix_z` only seeds PREVENT; DETECT still measures the live
+solid.
+
+**B1 — BATCHED, violations-only, one execute per stage.** Do **not** round-trip per relation. The
+connectivity sweep is **ONE `execute_rhinoscript_python_code` call per stage** whose body loops every
+declared relation in that stage's scope, measures each realized gap in-Rhino, and returns **only the
+violations** (`out_of_band` + `uncovered`) as compact JSON — never the passing gaps. Same shape as
+`reconcile.py`: a summary goes in, only violations come out.
+
+```python
+#! python3
+import scriptcontext as sc, Rhino, json
+# EDGES: [{type, from, to, to2?, at_surface, tol, penetration?, floating}] for THIS stage's scope.
+def sweep(edges):
+    violations = []
+    for e in edges:
+        ga, gb = _live(e["from"]), _live(e["to"])
+        if ga is None or gb is None:                       # C2: endpoint deleted/never built
+            violations.append({"edge": _key(e), "status": "uncovered"})
+            continue
+        g = realized_gap(ga, gb)                            # A1 realized solid-to-solid
+        lo, hi = band_for(e)                                # A3 per-type band
+        if not (lo <= g <= hi):
+            violations.append({"edge": _key(e), "gap": round(g, 4), "status": "out_of_band",
+                               "measured_between": [str(ga), str(gb)], "band": [lo, hi]})
+    # completeness (F): every NON-floating in-scope part needs >=1 measured contact
+    for pid in _nonfloating_parts_in_scope():
+        if not _has_measured_contact(pid, edges):
+            violations.append({"edge": {"from": pid, "to": None}, "status": "uncovered"})
+    print(json.dumps({"violations": violations}))           # ONLY violations enter context
+```
+
+**B2 — SAMPLE symmetric families.** A radial/helical array of N members: measure **all N on the
+initial bake**; on re-emit checkpoints measure a **sample** (first / middle / last + any previously
+flagged member); re-measure the **full N only when the generating `array` rule changed**.
+
+**B3 — STAGE SCOPE.** `check_connectivity --stage <id>` evaluates **only** relations whose endpoints
+are in the current or already-closed stages (mirror `reconcile.py --stage`). An edge into a
+not-yet-built stage is deferred, not failed.
+
+**C1 — CROSS-STAGE INVALIDATION; edges keyed by part_id ONLY (never GUID).** Re-emitting stage X must
+mark `connectivity_status: "not_run"` on the checkpoint of **every** stage that has a relation
+*crossing into* X — even though that stage's own geometry was untouched — because re-baking the rail
+can move it and orphan every baluster. The invalidation works **because edges are keyed by part_id**:
+the re-bake changes GUIDs but not part_ids, so the crossing edges are still found.
+
+**C2 — PRE-PURGE REFERENTIAL CHECK.** Deleting a stage (or part) must flag every edge pointing at a
+now-deleted part_id as **`uncovered`**, never silently pass. A deleted part = no relation to check =
+a *false pass by omission*; C2 turns that omission into an explicit FAIL.
+
+**F — FLOATING OPT-OUT.** Parts intended to float (pendant, cantilever tip, free finial) carry
+`floating: true` and are **EXEMPT** from the completeness rule, so they generate no false UNCOVERED
+pressure. They may still declare measured relations; they are simply not *required* to own one.
+
+**THE COMPLETENESS CLAUSE (ENFORCE).** Every **non-floating** part that participates in an assembly
+**must have at least one declared + measured contact.** A declared contact with **no measurement**
+is **UNCOVERED = FAIL**. A stage is GREEN (`connectivity_status: "green"`, eligible for
+`checkpoints[].status: "passed"`) **only** when its in-scope sweep returns **zero `out_of_band` and
+zero `uncovered`** entries. This is the single clause that makes "declare success while gaps remain"
+impossible: silence is no longer a pass — an unmeasured obligation is a failure.

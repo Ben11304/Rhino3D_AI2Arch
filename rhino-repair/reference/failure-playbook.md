@@ -382,3 +382,88 @@ returns a `(surface, error)` tuple — a non-zero error code names the grid prob
 a Tier-1 input fix, not a numeric one. This op has **no typed MCP tool**, so it runs through
 `execute_rhinocommon_csharp_code` / `execute_rhinoscript_python_code` — mind the
 [lamcp-dotnet-traps.md](lamcp-dotnet-traps.md).
+
+---
+
+## 8. Connectivity — part A does not reach support B (gap > tol)
+
+**Symptom.** The Phase-6 connectivity sweep (conventions §13/C9, the `check_connectivity --stage`
+operation owned by `rhino-scene-state`) returns an `out_of_band` entry for an edge: a baluster top
+**12 mm short** of the rail (`lands_on`, `+12 mm`), a column **floating above the floor**
+(`lands_on`/`on_top_of`, positive gap), or an arch **sunk into** a column top (`on_top_of`, negative
+gap). Every individual part passed `IsValid`/`IsSolid`/count/volume — §1–§7 say nothing about whether
+parts actually **touch**. This is the dominant false-confidence failure C9 exists to catch, and it is
+detected **numerically against the live solids by GUID** (A1), never by eye.
+
+**Cause.** The attach geometry was built to the wrong literal: a guessed Z instead of the support's
+**published** level, or — for a rising/helical support — a single global Z instead of the support's
+**Z-at-arc-length at A's own angle**. The realized gap between the two live solids is therefore outside
+the relation's per-type band (A3). A `+gap` means A stops short of B; a `-gap` on an `on_top_of` means A
+penetrates B (also a FAIL — `on_top_of` band is `[0,+tol]`).
+
+**Fix.** Read the **measured** gap from the sweep's violation record (it already carries the signed
+`gap` and the `measured_between:[guidA,guidB]`), then close it by moving/recomputing **A** and re-baking
+**A's stage only**. Two equivalent routes, prefer the resolver route (PREVENT) so the fix is principled,
+not a one-off nudge:
+
+```python
+#! python3
+import scriptcontext as sc
+import Rhino
+from Rhino.Geometry import Vector3d, Transform
+
+tol = sc.doc.ModelAbsoluteTolerance
+
+def support_z(support, angle_deg=None):
+    """Resolve B's published support level (conventions §13 PREVENT / build-plan support law).
+    helix_z: Z(theta) = base_z + pitch*((theta - start_angle)/360)  -- A4 curved support."""
+    kind = support["kind"]
+    if kind in ("plane_z", "top_z", "base_z", "z_at_angle"):
+        if kind == "z_at_angle" and "helix" in support:   # rising support sampled AT A's own angle
+            h = support["helix"]
+            return h["base_z"] + h["pitch"] * ((angle_deg - h.get("start_angle", 0.0)) / 360.0)
+        return support["value"]
+    if kind == "helix_z":
+        h = support["helix"]
+        return h["base_z"] + h["pitch"] * ((angle_deg - h.get("start_angle", 0.0)) / 360.0)
+    raise ValueError("unknown support kind %r" % kind)
+
+def close_gap_translate(guid_a, measured_gap, axis=Vector3d(0, 0, 1)):
+    """Route 1 (direct): translate A by the measured signed gap toward its support along 'axis'.
+    measured_gap > 0 => A is short (move toward B); < 0 => A penetrates (move away)."""
+    obj = sc.doc.Objects.FindId(guid_a)
+    geo = obj.Geometry.Duplicate()
+    v = Vector3d(axis); v.Unitize()
+    geo.Transform(Transform.Translation(v * measured_gap))   # +gap closes a short, -gap backs out a sink
+    sc.doc.Objects.Replace(guid_a, geo)
+    return guid_a
+```
+
+**Route 2 (preferred — recompute A.top via the resolver):** instead of nudging by the residual, rebuild
+A so its attach end lands exactly on `support_z(B.support, angle_deg=θ_A)`. This re-derives the literal
+from B's **pinned, published** support (§5a DIRECTION-PIN: B's published level is the pinned value, not
+the curve-normal value), so A is built to reach B rather than patched after the fact. Then re-emit **A's
+stage only** (conventions §12 scoped-idempotent purge+rebuild), so no other stage is disturbed and the
+count never doubles.
+
+**Helical / rising-support case (A4).** When B is a helical rail (or any rotated/curved support), there
+is no single "top Z" — the support height is `Z(θ) = base_z + pitch*((θ - start_angle)/360)`. Recompute
+A's attach Z at **A's own angle θ_A** (the angle of this array member, e.g. `value_ref {part:"rail",
+of:"z_at_angle", at:θ_A}`), never a global Z. For a radial/helical family fix the flagged member at its
+angle, then on the re-emit checkpoint re-measure a **sample** (first/middle/last + every previously
+flagged member, B2); re-measure the full N only if the `array` rule itself changed.
+
+**After the fix — re-run the sweep, and invalidate crossing stages (C1).** Re-baking A's stage changes
+A's GUID (not its part_id), so re-run `check_connectivity --stage <A's stage>`; it re-resolves the
+part_id-keyed edge to the new GUID and must come back **green** (gap in band). If the fix moved a
+**support** that other stages attach to, set `connectivity_status:"not_run"` on **every** stage with an
+edge crossing into the re-emitted stage and re-run their sweeps too (C1) — moving the rail can re-open
+the gap on every baluster even though those stages were untouched.
+
+**`uncovered`, not `out_of_band`.** If the sweep returns `uncovered` (a declared contact with no
+measurement, a non-floating part with no declared contact, or an edge into a now-deleted part_id, C2),
+the defect is **completeness**, not geometry: add the missing declared relation to the IR so the contact
+is actually built and measured (PREVENT), or mark the part `floating:true` if it genuinely floats (F).
+**Never** "fix" an `uncovered` by deleting the edge — that re-creates the false-pass-by-omission C2
+exists to forbid. Repairs here obey the same per-item (N=3) + global (12) budget as every other entry
+(C8); a connectivity defect that cannot be closed is **surfaced**, never hidden.

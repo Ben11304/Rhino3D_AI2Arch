@@ -280,6 +280,149 @@ def consumed_by_edge(part_id, edges):
 
 
 # --------------------------------------------------------------------------- #
+# connectivity checkpoint maintenance (conventions §13 / C9)
+# --------------------------------------------------------------------------- #
+# These two operations keep the per-stage CONNECTIVITY checkpoints honest when a
+# stage is re-emitted or deleted. They mutate the scene-graph artifact's
+# checkpoints/edges IN PLACE (they do NOT touch the live document) and are the
+# C1/C2 half of §13: the DETECT sweep (check_connectivity.py / stage_emit.py)
+# measures gaps, but a stage whose neighbour just moved must be RE-MEASURED, and a
+# deleted part must turn its now-orphaned contacts into explicit FAILs -- never a
+# false pass by omission.
+
+def _stage_of_part_in_graph(part_id, nodes, stages_index):
+    """Resolve a part_id's stage from the scene-graph nodes (mirror node.stage).
+
+    For an array instance 'baluster#3' falls back to the family id 'baluster'.
+    """
+    if part_id is None:
+        return None
+    sid = stages_index.get(part_id)
+    if sid is not None:
+        return sid
+    fam = str(part_id).split("#", 1)[0]
+    return stages_index.get(fam)
+
+
+def _build_stage_index(nodes):
+    """Map part_id -> stage from the scene-graph nodes (the part_id-keyed truth)."""
+    idx = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        pid = node.get("part_id") or node.get("name")
+        if pid:
+            idx[str(pid)] = node.get("stage")
+    return idx
+
+
+def invalidate_crossing_stages(graph, reemitted_stage):
+    """C1: re-emitting `reemitted_stage` dirties the connectivity of every stage
+    that has a relation CROSSING INTO it.
+
+    Re-baking a stage gives its parts new GUIDs but the SAME part_ids, so any edge
+    whose other endpoint lives in `reemitted_stage` may now be stale (the rail
+    moved, every baluster is orphaned). Because edges are part_id-keyed (never
+    GUID), we find those crossing edges and set connectivity_status='not_run' on
+    the OWNING stage's checkpoint (so the §13 sweep MUST re-run before that stage
+    is green again), even though that stage's own geometry was untouched.
+
+    Mutates graph['checkpoints'][*] in place. Returns the list of stage ids whose
+    connectivity was invalidated (excluding the re-emitted stage itself, which the
+    caller re-sweeps anyway).
+    """
+    nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+    edges = graph.get("edges", []) if isinstance(graph, dict) else []
+    checkpoints = graph.get("checkpoints", []) if isinstance(graph, dict) else []
+    stages_index = _build_stage_index(nodes)
+
+    crossing = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        # An edge is OWNED by the stage of its 'from' part (the part that DECLARES
+        # the contact obligation: the baluster lands_on the rail, so the edge is a
+        # baluster_stage obligation). The supports it reaches are 'to'/'to2'.
+        owning_stage = _stage_of_part_in_graph(edge.get("from"), nodes, stages_index)
+        if owning_stage is None or owning_stage == reemitted_stage:
+            # The re-emitted stage re-sweeps its OWN edges anyway; only OTHER
+            # stages whose obligations reach INTO it need invalidating.
+            continue
+        support_stages = [
+            _stage_of_part_in_graph(edge.get("to"), nodes, stages_index),
+            _stage_of_part_in_graph(edge.get("to2"), nodes, stages_index),
+        ]
+        # This OTHER stage's contact reaches a part in the re-emitted stage: the
+        # re-bake can move that support and orphan the obligation -> invalidate.
+        if reemitted_stage in support_stages:
+            crossing.add(owning_stage)
+
+    invalidated = []
+    for cp in checkpoints:
+        if not isinstance(cp, dict):
+            continue
+        if cp.get("stage") in crossing:
+            cp["connectivity_status"] = "not_run"
+            invalidated.append(cp.get("stage"))
+    return invalidated
+
+
+def referential_check_on_purge(graph, deleted_stage=None, deleted_part_ids=None):
+    """C2: deleting a stage/part flags every edge pointing at a now-deleted
+    part_id as UNCOVERED, instead of silently passing by omission.
+
+    A deleted part = no relation to check = a *false pass by omission*. This
+    PRE-PURGE referential check enumerates every edge whose 'from'/'to'/'to2'
+    references a part_id that is about to vanish (the deleted stage's parts, plus
+    any explicit deleted_part_ids), and returns an 'uncovered' connectivity entry
+    for each. The caller folds these into the affected checkpoints' connectivity
+    list and sets connectivity_status='violations'.
+
+    Returns a list of {edge, status:'uncovered', reason} entries (the §13
+    connectivity_entry shape). Does NOT delete anything itself.
+    """
+    nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+    edges = graph.get("edges", []) if isinstance(graph, dict) else []
+    stages_index = _build_stage_index(nodes)
+
+    doomed = set(str(p) for p in (deleted_part_ids or []))
+    if deleted_stage is not None:
+        for pid, sid in stages_index.items():
+            if sid == deleted_stage:
+                doomed.add(str(pid))
+        # Array instances: a family node 'baluster' in the stage dooms every
+        # instance id 'baluster#i' referenced by edges.
+    uncovered = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if edge.get("type") in ("child_of", "symmetric_about"):
+            continue  # logical relations are not measured contacts (no C2 FAIL)
+        refs = []
+        for role in ("from", "to", "to2"):
+            val = edge.get(role)
+            if val is None:
+                continue
+            fam = str(val).split("#", 1)[0]
+            if str(val) in doomed or fam in doomed:
+                refs.append((role, val))
+        if not refs:
+            continue
+        ekey = {"type": edge.get("type"), "from": edge.get("from"),
+                "to": edge.get("to")}
+        if edge.get("to2"):
+            ekey["to2"] = edge.get("to2")
+        uncovered.append({
+            "edge": ekey,
+            "status": "uncovered",
+            "reason": "edge references deleted part_id(s) %s (C2 pre-purge "
+                      "referential check: no relation to check is a FAIL, not a "
+                      "pass)" % ", ".join("%s=%s" % (r, v) for r, v in refs),
+        })
+    return uncovered
+
+
+# --------------------------------------------------------------------------- #
 # core reconcile
 # --------------------------------------------------------------------------- #
 
@@ -551,11 +694,15 @@ def print_report(report, as_json):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Reconcile a declared scene-graph against an actual Rhino "
-                    "document summary; exit non-zero on any mismatch.")
+                    "document summary; exit non-zero on any mismatch. Also runs "
+                    "the §13/C9 connectivity-checkpoint maintenance: cross-stage "
+                    "invalidation (C1) and the pre-purge referential check (C2).")
     parser.add_argument("--expected", required=True,
                         help="path to the expected scene-graph JSON (from the IR).")
-    parser.add_argument("--actual", required=True,
-                        help="path to the actual document summary JSON.")
+    parser.add_argument("--actual", default=None,
+                        help="path to the actual document summary JSON (required "
+                             "for the default reconcile mode; not used by the "
+                             "--invalidate-stage / --purge-stage modes).")
     parser.add_argument("--tol", type=float, default=None,
                         help="bbox/dimension match tolerance in model units "
                              "(default: the expected scene-graph 'tolerance').")
@@ -567,11 +714,43 @@ def main(argv=None):
                              "§12): only nodes/objects tagged with this stage are "
                              "checked, so a re-emitted stage is verified without "
                              "the rest of the model registering as defects.")
+    parser.add_argument("--invalidate-stage", default=None,
+                        help="C1 cross-stage invalidation MODE: name the stage "
+                             "being RE-EMITTED. Sets connectivity_status='not_run' "
+                             "on every OTHER stage whose checkpoint has a relation "
+                             "crossing into it (edges are part_id-keyed, §13/C1), "
+                             "then prints the invalidated stage ids. With --apply "
+                             "the mutation is written back to --expected.")
+    parser.add_argument("--purge-stage", default=None,
+                        help="C2 pre-purge referential check MODE: name the stage "
+                             "about to be DELETED. Flags every edge pointing at one "
+                             "of its now-deleted part_ids as UNCOVERED (§13/C2) so "
+                             "a deleted part becomes an explicit FAIL, never a "
+                             "false pass by omission.")
+    parser.add_argument("--purge-parts", default=None,
+                        help="comma-separated part_ids about to be deleted "
+                             "(C2 referential check), in addition to --purge-stage.")
+    parser.add_argument("--apply", action="store_true",
+                        help="write the mutated scene-graph back to --expected "
+                             "(for --invalidate-stage / --purge-stage). Without it "
+                             "the modes are read-only and only report.")
     parser.add_argument("--json", action="store_true",
                         help="emit the report as JSON instead of text.")
     args = parser.parse_args(argv)
 
     expected = load_json(args.expected)
+
+    # --- C1 cross-stage invalidation mode ----------------------------------- #
+    if args.invalidate_stage is not None:
+        return _run_invalidate(expected, args)
+
+    # --- C2 pre-purge referential check mode -------------------------------- #
+    if args.purge_stage is not None or args.purge_parts is not None:
+        return _run_purge(expected, args)
+
+    # --- default reconcile mode --------------------------------------------- #
+    if args.actual is None:
+        parser.error("--actual is required for the default reconcile mode")
     actual = load_json(args.actual)
 
     tol = args.tol
@@ -586,6 +765,117 @@ def main(argv=None):
     print_report(report, args.json)
 
     return 0 if report["ok"] else 1
+
+
+def _write_back(path, graph):
+    """Persist a mutated scene-graph to disk atomically (tmp + os.replace).
+
+    Mirrors the conventions §12a ledger-after-geometry discipline: write the JSON
+    to a sibling temp file then os.replace it into place so a crash never leaves a
+    half-written ledger.
+    """
+    import os
+    import tempfile
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(graph, handle, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _run_invalidate(graph, args):
+    """C1: invalidate connectivity of every stage crossing into the re-emitted one."""
+    invalidated = invalidate_crossing_stages(graph, args.invalidate_stage)
+    if args.apply:
+        _write_back(args.expected, graph)
+    payload = {
+        "mode": "invalidate-stage",
+        "reemitted_stage": args.invalidate_stage,
+        "invalidated_stages": invalidated,
+        "applied": bool(args.apply),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print("=== C1 cross-stage connectivity invalidation ===")
+        print("re-emitted stage: %s" % args.invalidate_stage)
+        if invalidated:
+            print("invalidated (connectivity_status -> not_run):")
+            for sid in invalidated:
+                print("  - %s" % sid)
+        else:
+            print("no other stage has a relation crossing into this stage.")
+        print("applied=%s" % bool(args.apply))
+    # Invalidation is an advisory mutation, not a failure: exit 0.
+    return 0
+
+
+def _run_purge(graph, args):
+    """C2: flag edges pointing at to-be-deleted part_ids as UNCOVERED."""
+    parts = None
+    if args.purge_parts:
+        parts = [p.strip() for p in args.purge_parts.split(",") if p.strip()]
+    uncovered = referential_check_on_purge(
+        graph, deleted_stage=args.purge_stage, deleted_part_ids=parts)
+    if args.apply:
+        # Fold the uncovered entries into every checkpoint whose stage owns one of
+        # the orphaned edges, and mark those checkpoints' connectivity violations.
+        _apply_purge_uncovered(graph, uncovered)
+        _write_back(args.expected, graph)
+    payload = {
+        "mode": "purge-stage",
+        "deleted_stage": args.purge_stage,
+        "deleted_parts": parts,
+        "uncovered": uncovered,
+        "applied": bool(args.apply),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print("=== C2 pre-purge referential check ===")
+        print("deleting stage=%s parts=%s" % (args.purge_stage, parts))
+        if uncovered:
+            print("UNCOVERED edges (now-orphaned contacts = FAIL, not a silent pass):")
+            for u in uncovered:
+                e = u["edge"]
+                print("  - %s->%s : %s" % (e.get("from"), e.get("to"),
+                                           u.get("reason")))
+        else:
+            print("no edge references a deleted part_id.")
+        print("applied=%s" % bool(args.apply))
+    # An orphaned contact is a FAIL: exit non-zero when any uncovered edge exists.
+    return 1 if uncovered else 0
+
+
+def _apply_purge_uncovered(graph, uncovered):
+    """Fold C2 uncovered entries into the owning stages' checkpoints in place."""
+    if not uncovered:
+        return
+    nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+    stages_index = _build_stage_index(nodes)
+    checkpoints = graph.setdefault("checkpoints", []) if isinstance(graph, dict) else []
+    cp_by_stage = {cp.get("stage"): cp for cp in checkpoints
+                   if isinstance(cp, dict)}
+    for u in uncovered:
+        owner = u["edge"].get("from")
+        sid = _stage_of_part_in_graph(owner, nodes, stages_index)
+        cp = cp_by_stage.get(sid)
+        if cp is None:
+            continue
+        # Persist only the schema-clean connectivity_entry fields (edge, status):
+        # the scene-graph 'connectivity_entry' has additionalProperties:false and
+        # no 'reason' field, so the human-readable 'reason' stays in the report
+        # payload but is stripped here so the written artifact still validates.
+        entry = {"edge": u["edge"], "status": u["status"]}
+        cp.setdefault("connectivity", []).append(entry)
+        cp["connectivity_status"] = "violations"
 
 
 if __name__ == "__main__":

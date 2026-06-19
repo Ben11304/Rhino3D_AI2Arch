@@ -202,13 +202,69 @@
       "maxItems": 3,
       "description": "[x, y, z] in document 'units' against world_frame."
     },
+    "point3d_expr": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/numeric" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[x, y, z] where each coordinate is a numeric (a literal number OR a value_ref). Plain literal triples remain valid (existing examples). Used for attach origins that must resolve a coordinate from another part's published 'support' (e.g. a baluster top whose z is rail.z_at_angle), the PREVENT leg of §13."
+    },
+    "value_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A NON-LITERAL numeric value resolved at Phase-3 codegen against the live build, not a hardcoded coordinate. This is the PREVENT leg of the connectivity triad (conventions §13/C9): a baluster top references the rail's realized helix-Z at its angle, so attach geometry resolves to the correct literal instead of a guessed number. Exactly one of {param, op, part} must be present. Resolution: 'param' looks up params[name]; 'op' folds args with the arithmetic operator; 'part' reads a realized support coordinate PUBLISHED by another part's 'support' block (or its baked solid) — 'of' selects which coordinate, 'at' (for z_at_angle) supplies the angle in degrees. A producer may leave value_refs symbolic in the IR; the executor must resolve every value_ref to a finite number BEFORE baking, and the resolved literal is what the connectivity sweep (§13) later measures against.",
+      "properties": {
+        "param": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of a top-level params[] entry to substitute (e.g. 'seat_height'). Mutually exclusive with 'op' and 'part'."
+        },
+        "op": {
+          "type": "string",
+          "enum": ["+", "-", "*", "/"],
+          "description": "Arithmetic operator folded left-to-right over 'args' (each a number or nested value_ref). For '-' and '/', args[0] is the minuend/numerator. Mutually exclusive with 'param' and 'part'."
+        },
+        "args": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/numeric" },
+          "description": "Operands for 'op'; each is itself a numeric (number OR value_ref), so expressions nest (e.g. rail_base_z + pitch*turns)."
+        },
+        "part": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Part id whose realized support coordinate this value reads (the PREVENT resolution of an attach point). Pairs with 'of'. Mutually exclusive with 'param' and 'op'."
+        },
+        "of": {
+          "type": "string",
+          "enum": ["z", "top_z", "base_z", "z_at_angle", "centroid_z"],
+          "description": "Which coordinate of the referenced part to read. 'top_z'/'base_z' are the published plane heights (part.support); 'z' is the frame-origin z; 'centroid_z' is the realized solid centroid z; 'z_at_angle' is the helix/arc Z at the angle given by 'at' (degrees) — for helical/curved supports this is the A4 realized-arc-length height, NOT a face label."
+        },
+        "at": {
+          "$ref": "#/$defs/numeric",
+          "description": "Angle in degrees (number or value_ref) for of='z_at_angle' on a helical/radial support; ignored otherwise."
+        }
+      },
+      "oneOf": [
+        { "required": ["param"] },
+        { "required": ["op", "args"] },
+        { "required": ["part", "of"] }
+      ]
+    },
+    "numeric": {
+      "description": "Any IR numeric field: a plain literal number (keeps every existing example valid) OR a value_ref object resolved at codegen (conventions §13). Use this wherever dims/origins/heights/penetration/tol live so an attach coordinate can be published-by/derived-from another part instead of guessed.",
+      "oneOf": [
+        { "type": "number" },
+        { "$ref": "#/$defs/value_ref" }
+      ]
+    },
     "frame": {
       "type": "object",
       "additionalProperties": false,
       "description": "Explicit construction plane a part is built on. The part is authored on Plane.WorldXY then moved to this frame via Transform.PlaneToPlane.",
       "required": ["origin"],
       "properties": {
-        "origin": { "$ref": "#/$defs/point3d" },
+        "origin": { "$ref": "#/$defs/point3d_expr", "description": "Frame origin [x,y,z]; each coordinate may be a literal or a value_ref so an attach origin can resolve from another part's published 'support' (§13 PREVENT)." },
         "plane": {
           "type": "string",
           "description": "Named target plane, e.g. 'WorldXY', 'WorldYZ', 'WorldXZ', or a custom frame name resolved by the executor. Default WorldXY when omitted."
@@ -252,28 +308,92 @@
         }
       }
     },
+    "support": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "description": "A support surface/level a part PUBLISHES so OTHER parts can attach to it (the PREVENT leg of §13/C9): a rail publishes its helix law, a floor publishes its top plane, and a baluster's frame origin references it via a value_ref {part:'<this id>', of:'z_at_angle', at:<angle>}. The published support is also what the connectivity sweep treats as the intended attach surface; the DETECT leg still measures the realized solid-to-solid gap (A1/A4), so a wrong support does not produce a false pass.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["plane_z", "top_z", "base_z", "helix_z", "z_at_angle"],
+          "description": "plane_z/top_z/base_z publish a single horizontal level ('value'); helix_z/z_at_angle publish a Z-law evaluated at an angle (see 'helix'), the realized-arc-length height used for helical/curved attach (A4) — NOT a face label."
+        },
+        "value": {
+          "$ref": "#/$defs/numeric",
+          "description": "The published level in 'units' for kind in {plane_z, top_z, base_z}; a numeric (literal OR value_ref)."
+        },
+        "helix": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Parameters of the published Z-law for kind in {helix_z, z_at_angle}. Z at angle theta(deg) = base_z + pitch*((theta - start_angle)/360). 'radius' locates the law in plan so a value_ref of='z_at_angle' resolves the attach height at a member's angle (A4).",
+          "required": ["base_z", "pitch"],
+          "properties": {
+            "base_z": { "$ref": "#/$defs/numeric", "description": "Z at start_angle, in 'units'." },
+            "pitch": { "$ref": "#/$defs/numeric", "description": "Z rise per full 360-degree turn, in 'units' (signed: positive rises)." },
+            "radius": { "$ref": "#/$defs/numeric", "description": "Plan radius of the helix/arc, in 'units'." },
+            "start_angle": { "$ref": "#/$defs/numeric", "description": "Angle (degrees) at which Z == base_z. Default 0." }
+          }
+        }
+      }
+    },
+    "array": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "count"],
+      "description": "Declares that ONE part stands for a FAMILY of 'count' instances generated by a rule (radial/helical/linear). The generating rule is authoritative: on initial bake the connectivity sweep measures all N members; on re-emit checkpoints it samples first/middle/last + any previously flagged member, and only re-measures the full N when this generating rule changed (conventions §13, B2). Each instance is baked with UserString part_id '<id>#<i>' (0-based) so the scene-graph and edges remain part_id-keyed (C1).",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["radial", "helical", "linear"],
+          "description": "radial: 'count' copies rotated by 'angle_step' about 'axis' at 'radius'. helical: as radial but each step also rises by 'z_step' (or 'pitch'/360 * angle_step). linear: 'count' copies translated by 'step' along 'axis'."
+        },
+        "count": { "type": "integer", "minimum": 1, "description": "Number of instances in the family." },
+        "axis": { "type": "string", "description": "Array axis for radial/helical (rotation axis, e.g. 'WorldZ') or linear (translation direction). Default WorldZ for radial/helical." },
+        "radius": { "$ref": "#/$defs/numeric", "description": "Plan radius for radial/helical, in 'units'." },
+        "angle_step": { "$ref": "#/$defs/numeric", "description": "Per-instance rotation in degrees for radial/helical." },
+        "z_step": { "$ref": "#/$defs/numeric", "description": "Per-instance Z rise for helical, in 'units' (alternative to deriving from 'pitch')." },
+        "pitch": { "$ref": "#/$defs/numeric", "description": "Helix Z rise per full 360-degree turn, in 'units' (z_step may be derived as pitch*angle_step/360)." },
+        "step": { "$ref": "#/$defs/point3d_expr", "description": "Per-instance translation vector for linear arrays, in 'units'." },
+        "start_angle": { "$ref": "#/$defs/numeric", "description": "Angle (degrees) of instance 0 for radial/helical. Default 0." }
+      }
+    },
     "relation": {
       "type": "object",
       "additionalProperties": false,
       "required": ["type"],
-      "description": "A spatial/logical relation between this part and another. 'penetration' is REQUIRED when type='interpenetrate' (parts feeding a boolean union must overlap 0.5-2mm, correction C3).",
+      "description": "A spatial/logical relation between this part and another. This is a CONNECTIVITY OBLIGATION, not just intent: at Phase 5/6 the connectivity sweep (conventions §13/C9) measures the REALIZED gap between the two live solids (by GUID, A1) and enforces a per-relation-type tolerance band (A3). 'penetration' is REQUIRED when type='interpenetrate' (parts feeding a boolean union must overlap 0.5-2mm, correction C3). Contact relations (on_top_of, lands_on, meets, coincident, spans, spans_between) participate in the completeness clause: every NON-floating assembly part must own >=1 measured contact or it is flagged UNCOVERED=FAIL.",
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate"]
+          "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate", "lands_on", "meets", "spans", "spans_between"],
+          "description": "Relation kind. Contact/support kinds and their §13 (A3) measured-gap bands: on_top_of => realized gap in [0,+tol], any penetration is a FAIL (A rests on top of B's surface); lands_on => A's base reaches B's realized top, gap in [-penetration,+tol] (a column landing on a floor, may seat slightly in); meets => two ends abut, gap in [-penetration,+tol]; coincident => |gap| <= tol; interpenetrate => gap must be NEGATIVE 0.5-2mm (C3, union overlap); spans => A bridges to B at both ends, both endpoint gaps in band; spans_between => A is supported at BOTH endpoints by 'to' and 'to2', each endpoint gap in band. symmetric_about / child_of are logical, not measured. For curved/helical supports use at_surface='realized' so the gap is measured to the nearest point on B's realized solid (A4), never a scalar face height."
         },
         "this": { "type": "string", "description": "Part id this relation is anchored on (defaults to the owning part)." },
-        "to": { "type": "string", "description": "The other part id (or symmetry/frame name for symmetric_about)." },
+        "to": { "type": "string", "description": "The other part id (or symmetry/frame name for symmetric_about). For spans_between this is the FIRST support; the second is 'to2'." },
+        "to2": { "type": "string", "description": "Second support part id for type='spans_between' (A is supported at both ends; both endpoint gaps are measured and must fall in band)." },
+        "tol": {
+          "$ref": "#/$defs/numeric",
+          "description": "Optional per-relation acceptance band half-width in 'units' for the §13 measured-gap check, OVERRIDING the document tolerance for this edge only (A3). Interpreted per the relation type's band (see 'type'). When omitted the executor uses the document ModelAbsoluteTolerance. A numeric so it can itself be derived (e.g. a fraction of a member radius)."
+        },
+        "at_surface": {
+          "type": "string",
+          "enum": ["top", "bottom", "nearest", "centerline", "realized"],
+          "description": "WHERE on the 'to' part the gap is measured (A3/A4). 'top'/'bottom' = the part's published support plane (axis-aligned, fast); 'nearest' = nearest point on B's realized solid via Brep.ClosestPoint; 'centerline' = to the member axis; 'realized' = REQUIRED for curved/helical/rotated supports — the gap is the realized solid-to-solid MinDistanceBetween (A4), Z-at-arc-length, NOT a face label. Defaults to 'nearest' (realized-solid measurement) so a check is never silently reduced to AABB arithmetic on a non-axis-aligned relation (A2)."
+        },
         "penetration": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Overlap depth in 'units' (typically 0.5-2mm) for interpenetrate relations feeding a boolean union. Coincident/coplanar contact is degenerate and forbidden for unions."
+          "$ref": "#/$defs/numeric",
+          "description": "Overlap depth in 'units' (typically 0.5-2mm) for interpenetrate relations feeding a boolean union, and the allowed negative-gap floor for lands_on/meets seating. Coincident/coplanar contact is degenerate and forbidden for unions. A numeric (literal OR value_ref)."
         }
       },
       "allOf": [
         {
           "if": { "properties": { "type": { "const": "interpenetrate" } } },
           "then": { "required": ["penetration", "to"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "spans_between" } } },
+          "then": { "required": ["to", "to2"] }
         }
       ]
     },
@@ -303,8 +423,8 @@
         "frame": { "$ref": "#/$defs/frame", "description": "Construction frame for a primitive part." },
         "dims": {
           "type": "object",
-          "description": "Primitive dimensions in 'units', e.g. box {x,y,z}, cylinder {radius,height}, sphere {radius}, cone {radius,height}, plane {x,y}. Keys depend on 'primitive'.",
-          "additionalProperties": { "type": "number" }
+          "description": "Primitive dimensions in 'units', e.g. box {x,y,z}, cylinder {radius,height}, sphere {radius}, cone {radius,height}, plane {x,y}. Keys depend on 'primitive'. Each value is a numeric (literal number OR value_ref), so e.g. a baluster height can resolve as rail.z_at_angle - base_z instead of a guessed literal (§13 PREVENT).",
+          "additionalProperties": { "$ref": "#/$defs/numeric" }
         },
         "control_points": {
           "type": "array",
@@ -341,8 +461,8 @@
           "description": "Ordered part ids of section curves to loft through (loft). All must run the same direction and be seam-aligned (correction C7)."
         },
         "rail": { "type": "string", "description": "Part id of the rail curve (sweep1). Must be G1 continuous (correction C7)." },
-        "height": { "type": "number", "description": "Extrusion distance in 'units' (extrude)." },
-        "thickness": { "type": "number", "description": "Shell wall thickness in 'units' (shell). Must be < min feature size; brep must be closed/capped before shelling (correction C6)." },
+        "height": { "$ref": "#/$defs/numeric", "description": "Extrusion distance in 'units' (extrude); a numeric (literal OR value_ref so the distance can resolve to a published support height, §13)." },
+        "thickness": { "$ref": "#/$defs/numeric", "description": "Shell wall thickness in 'units' (shell); a numeric (literal OR value_ref). Must be < min feature size; brep must be closed/capped before shelling (correction C6)." },
         "open_face": {
           "description": "Face index, or list of face indices, left open by the shell (shell).",
           "oneOf": [
@@ -366,7 +486,20 @@
         "relations": {
           "type": "array",
           "items": { "$ref": "#/$defs/relation" },
-          "description": "Relations this part has to others. Union inputs must declare an 'interpenetrate' relation with a penetration depth (correction C3)."
+          "description": "Relations this part has to others. Union inputs must declare an 'interpenetrate' relation with a penetration depth (correction C3). Contact relations (on_top_of/lands_on/meets/coincident/spans/spans_between) are the measured connectivity obligations enforced by §13/C9: a non-floating part with no measured contact is UNCOVERED=FAIL."
+        },
+        "support": {
+          "$ref": "#/$defs/support",
+          "description": "A support surface/level this part PUBLISHES for others to attach to (§13 PREVENT). E.g. a floor publishes top_z, a helical rail publishes helix_z; attachers reference it via value_ref {part, of, at}."
+        },
+        "array": {
+          "$ref": "#/$defs/array",
+          "description": "Declares this part as a FAMILY of 'count' instances generated by a radial/helical/linear rule (§13 B2). Each instance bakes as part_id '<id>#<i>'."
+        },
+        "floating": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true this part is INTENDED to float (pendant tip, cantilever end, free finial) and is EXEMPT from the §13/C9 contact-completeness rule, so it never generates a false UNCOVERED. A floating part may still declare measured relations; it just is not REQUIRED to own one."
         }
       },
       "allOf": [

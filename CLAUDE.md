@@ -93,6 +93,19 @@ sync (the doc states they must match).
   its files to `MANIFEST.md`.
 - If it introduces a new invariant, define it in `shared/conventions.md` first, then reference it.
 
+## v2 invariants — connectivity, direction-pin, staging (honor these)
+
+v2 added correction **C9** and supporting machinery on top of v1. When editing, preserve:
+
+- **C9 connectivity (conventions §13).** Every declared contact relation (`lands_on`, `on_top_of`, `meets`, `spans_between`, `coincident`, `interpenetrate`) is a *measured numeric obligation*. The realized gap is measured **GUID-to-GUID between two live solids** in-Rhino (`Brep.ClosestPoint`, carrying `measured_between=[guidA,guidB]`) — **never** against an IR-derived coordinate (that just re-confirms the bug). A declared contact with no measurement is `UNCOVERED` = FAIL. `floating:true` parts are exempt. Owner: `rhino-scene-state` (`check_connectivity.py` classifies; `stage_emit.py --connectivity-edges` measures; `reconcile.py` maintains cross-stage invalidation). The connectivity *verdict* is written by `rhino-scene-state` only; render-and-look's connectivity question is advisory and can never fail the build (preserves C4 vision-demotion).
+- **Per-relation-type tolerance band** (directed, never one symmetric ±tol): `on_top_of` [0,+tol]; `coincident` [-tol,+tol]; `lands_on`/`meets`/`spans*` [-penetration,+tol]; `interpenetrate` [-2,-0.5] mm.
+- **Relational-IR (PREVENT).** `validate_plan.py --resolve` expands `value_ref`/`support`/`array` into a literal IR so attach points are computed, not hand-typed constants. The resolver is a single topo-sorted forward pass — no eval, no general solver; a cycle is an error.
+- **Direction-pin (codegen rule 10, §5a).** Any directional op (`Extrusion.Create`/`RevSurface.Create`/…) must read `GetBoundingBox(True)` and pin the result to the IR-intended Z (`Transform.Translation`). Curve normal direction is not trustworthy (the real seat-extruded-to-410-not-450 bug).
+- **Capability probe + visible degradation.** `detect_server.py --rhinocommon-probe` checks fragile methods (`Brep.CreateOffset` etc.); a missing method falls back with `shell_degraded:true`, never a silent rollback.
+- **Persistence (§12).** Checkpoint the `.3dm` (via `execute_*` `sc.doc.WriteFile`, confirm `True`) *before* writing the sidecar JSON ledger; resume re-binds `part_id→GUID` from the reopened `UserString` (saved GUID is a hint only).
+
+Definition of Done: the framework may only say ✅ when every non-floating declared contact has been numerically proven in-band — proven, not assumed.
+
 ## Commit / push etiquette
 
 - Keep helpers stdlib‑only and 3.9‑compatible; run the four checks above before committing.

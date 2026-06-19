@@ -31,7 +31,7 @@ The fix is **not** a bigger model — it's *method*. This suite attacks the LLM'
    *scene‑graph* — instead of holding geometry in the model's head.
 2. **Giving the model eyes** via a render‑and‑look loop, while routing every *measurable* question to
    math instead of vision.
-3. **Encoding the eight ways LLM‑driven CAD silently fails** (the [corrections](#the-8-non-negotiable-corrections)) as hard rules every skill obeys.
+3. **Encoding the nine ways LLM‑driven CAD silently fails** (the [corrections](#the-9-non-negotiable-corrections)) as hard rules every skill obeys.
 
 > **Mental model:** *Never hold geometry state in your head; read it back from the document or the
 > artifacts.* The MCP server does what your hands and eyes do; the skills supply the discipline,
@@ -46,7 +46,7 @@ The fix is **not** a bigger model — it's *method*. This suite attacks the LLM'
 - [The 8 skills](#the-8-skills)
 - [The modeling cognition loop](#the-modeling-cognition-loop)
 - [The IR contract](#the-ir-contract-hand-off-between-phases)
-- [The 8 non‑negotiable corrections](#the-8-non-negotiable-corrections)
+- [The 9 non‑negotiable corrections](#the-9-non-negotiable-corrections)
 - [Phased roadmap](#phased-roadmap)
 - [Repo layout](#repo-layout)
 
@@ -102,7 +102,7 @@ you never invoke them by hand. See [`INSTALL.md`](INSTALL.md) for the full setup
 
         BENEATH EVERYTHING:
           • Rhino MCP server  (hands + eyes: create/loft/boolean/execute_*, sensors, gh_*)
-          • shared/conventions.md  (single source of truth for all 8 corrections)
+          • shared/conventions.md  (single source of truth for all 9 corrections)
 ```
 
 The skill layer never does geometry the MCP server can't; it constrains *how* the model drives the
@@ -171,7 +171,7 @@ truth.
 
 ---
 
-## The 8 non‑negotiable corrections
+## The 9 non‑negotiable corrections
 
 These come from an adversarial review of how LLM‑driven CAD silently fails. Every relevant skill
 honors them; [`shared/conventions.md`](shared/conventions.md) defines each one once.
@@ -186,6 +186,7 @@ honors them; [`shared/conventions.md`](shared/conventions.md) defines each one o
 | **C6** | **Revolve / shell.** `RevSurface.Create` returns a **surface, not a solid**; the profile must start+end on the axis (or be closed); **cap before shell**; `Brep.CreateOffset(solid=True)` needs a closed brep. | Skipping cap‑before‑shell or an off‑axis profile yields an open surface that silently fails to solidify. |
 | **C7** | **Pre‑flight inputs**, not just post‑check results: loft curves same‑direction + seam‑aligned; sweep rail G1; fillet radius < min local edge; offset distance < min feature; revolve axis coplanar with profile. | Most op failures are caused by bad *inputs*; checking only the result wastes the budget chasing symptoms. |
 | **C8** | **Repair budget.** A per‑failure‑item cap (each item ≤ N=3 attempts, then mark "could not fix" and surface) **plus** an independent global wall (default 12), never one global counter, with a per‑(item,part) convergence ledger. | Stops the loop from thrashing forever on one defect or ping‑ponging two conflicting items. |
+| **C9** | **Connectivity is a numeric obligation (v2).** Every declared contact (`lands_on`, `on_top_of`, `meets`, `spans_between`, `coincident`, `interpenetrate`) must be proven by a **realized GUID‑to‑GUID gap** measured in‑Rhino (`Brep.ClosestPoint`) inside a per‑relation‑type tolerance band. A declared contact with **no** measurement is `UNCOVERED` = FAIL; `floating:true` parts are exempt. Prevented at the source by relational‑IR (`value_ref`/`support`/arrays) so an attach point is *computed*, not a hand‑typed constant. | The dominant real‑session failure: the framework said ✅ while balusters never reached the rail, columns floated, and arches missed the column tops — every one caught by the user, not the framework. C9 makes "declare success with a gap" structurally impossible. |
 
 > The most over‑trusted step is **`extract_profile`**: average left + right silhouettes about the
 > axis to cancel perspective skew, flag low confidence, and fall back to archetype profiles chosen by

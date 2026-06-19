@@ -30,27 +30,62 @@
   },
   "parts": [
     {
+      "id": "floor",
+      "layer": "ground",
+      "provenance": "ground reference plane the four legs land on; publishes a plane_z support (§13 PREVENT) so leg heights resolve from it, not a guessed 0. Not part of the welded chair_solid union.",
+      "primitive": "box",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [0, 0, -5]
+      },
+      "dims": { "x": 1200, "y": 1200, "z": 10 },
+      "support": {
+        "kind": "plane_z",
+        "value": 0
+      }
+    },
+    {
       "id": "seat",
       "layer": "chair_seat",
-      "provenance": "prompt: square seat slab at 450mm seat height",
+      "provenance": "prompt: square seat slab at 450mm seat height. Publishes base_z=410 (seat bottom) as a support so leg heights resolve to reach it (§13 PREVENT).",
       "primitive": "box",
       "frame": {
         "plane": "WorldXY",
         "origin": [0, 0, 430]
       },
-      "dims": { "x": 420, "y": 420, "z": 40 }
+      "dims": { "x": 420, "y": 420, "z": 40 },
+      "support": {
+        "kind": "base_z",
+        "value": 410
+      }
     },
     {
       "id": "leg_front_right",
       "layer": "chair_legs",
-      "provenance": "prompt: four cylindrical legs; front-right instance",
+      "provenance": "prompt: four cylindrical legs; front-right instance. Height is a value_ref (§13 PREVENT): seat.base_z - floor.plane_z + join_penetration, so the leg is built to reach the seat bottom (and sink 1.5mm in) instead of a guessed 411.5.",
       "primitive": "cylinder",
       "frame": {
         "plane": "WorldXY",
         "origin": [180, 180, 0]
       },
-      "dims": { "radius": 18, "height": 411.5 },
+      "dims": {
+        "radius": 18,
+        "height": {
+          "op": "+",
+          "args": [
+            {
+              "op": "-",
+              "args": [
+                { "part": "seat", "of": "base_z" },
+                { "part": "floor", "of": "top_z" }
+              ]
+            },
+            { "param": "join_penetration" }
+          ]
+        }
+      },
       "relations": [
+        { "type": "lands_on", "to": "floor", "at_surface": "top" },
         { "type": "interpenetrate", "to": "seat", "penetration": 1.5 }
       ]
     },
@@ -65,6 +100,7 @@
       },
       "dims": { "radius": 18, "height": 411.5 },
       "relations": [
+        { "type": "lands_on", "to": "floor", "at_surface": "top" },
         { "type": "interpenetrate", "to": "seat", "penetration": 1.5 },
         { "type": "symmetric_about", "to": "WorldYZ" }
       ]
@@ -80,6 +116,7 @@
       },
       "dims": { "radius": 18, "height": 411.5 },
       "relations": [
+        { "type": "lands_on", "to": "floor", "at_surface": "top" },
         { "type": "interpenetrate", "to": "seat", "penetration": 1.5 }
       ]
     },
@@ -94,6 +131,7 @@
       },
       "dims": { "radius": 18, "height": 411.5 },
       "relations": [
+        { "type": "lands_on", "to": "floor", "at_surface": "top" },
         { "type": "interpenetrate", "to": "seat", "penetration": 1.5 },
         { "type": "symmetric_about", "to": "WorldYZ" }
       ]

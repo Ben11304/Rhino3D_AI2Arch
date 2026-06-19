@@ -94,6 +94,62 @@ the `gh_*` family, `analyze_objects` (math verification), and `capture_viewport`
 
 ---
 
+## RhinoCommon method-availability probe (`--rhinocommon-probe`) — E4
+
+The MCP-name classification above answers *"which server flavor is connected?"*. A **different**
+question is *"does THIS Rhino build expose the fragile RhinoCommon methods we depend on?"* — because a
+few members vary by Rhino version, and one (`Brep.CreateOffset`) has a solid overload that can be
+absent even when the member exists. A call to a missing member raises an
+`AttributeError`/`MissingMethodException` **inside** `execute_rhinoscript_python_code` that reads like
+an unrelated geometry failure.
+
+`detect_server.py --rhinocommon-probe` is a **separate code path** from `classify()` (no tool-name
+parsing, no flavor heuristics). It **emits a RhinoCommon python snippet** — it does not run it (this
+environment has no live Rhino). You send the emitted snippet through `execute_rhinoscript_python_code`;
+it `hasattr`-probes the fragile members against the live Rhino assembly and prints a JSON
+**capability map**:
+
+```json
+{
+  "rhinocommon_probe": true,
+  "rhino_version": "8.x",
+  "capabilities": {
+    "brep_create_offset":                 {"present": true,  "owner": "Brep",         "member": "CreateOffset",          "degraded_fallback": "..."},
+    "rev_surface_create":                 {"present": true,  "owner": "RevSurface",   "member": "Create",                "degraded_fallback": "..."},
+    "nurbs_network_surface":              {"present": false, "owner": "NurbsSurface", "member": "CreateNetworkSurface",  "degraded_fallback": "..."},
+    "brep_create_offset_solid_overload":  {"present": true,  "owner": "Brep",         "member": "CreateOffset",          "degraded_fallback": "..."}
+  }
+}
+```
+
+Probed members (and the build-dependent overload):
+
+- `Brep.CreateOffset` — solid **shell** offset.
+- `RevSurface.Create` — **revolve** surface (then `Brep.CreateFromRevSurface` + cap, C6).
+- `NurbsSurface.CreateNetworkSurface` — **network surface**.
+- `Brep.CreateOffset` **solid overload** `(brep, dist, solid, extend, tol)` — `hasattr` can return
+  `True` while this specific overload is absent; resolve it with a guarded `try/except` at call time
+  and fall back if it throws.
+
+### Degrade visibly, do not silently roll back (`shell_degraded`)
+
+When a probed member is **`present:false`** (or the overload throws), the op must take the fallback
+documented in
+[`../../rhino-geometry-api/reference/geometry-ops.md`](../../rhino-geometry-api/reference/geometry-ops.md)
+(method-availability + fallback table) — e.g. a missing `Brep.CreateOffset` shell becomes a
+**loft between the inner and outer profiles** / manual two-shell solid. The fallback produces an
+**approximate** solid, so it MUST be tagged **`shell_degraded:true`** on the part's node in the
+scene-graph (alongside the GUID). That tag makes the degradation **visible** to verification and to the
+user, instead of the alternative — silently rolling back the whole stage when one fragile method is
+missing. A degraded op is a *flagged success*, not a failure; the scoped staged-build (conventions
+§12) still bounds any true op failure to its own stage.
+
+The probe is therefore the **E4 counterpart** to the codegen guard's RULE 10 (E3 direction-pin): RULE
+10 catches a directional op that silently lands at the wrong Z; the probe catches a fragile method
+that silently is not there. Both convert a silent failure into a visible, recoverable one.
+
+---
+
 ## v1 recommendation: pick ONE server
 
 For v1, **commit to a single server for the entire job** — ideally **`rhinomcp`**, which is the

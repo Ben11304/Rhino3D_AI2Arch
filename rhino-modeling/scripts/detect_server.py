@@ -14,6 +14,13 @@ Examples
 Output: a human-readable report (and, with --json, a machine-readable JSON object) naming the
 detected flavor, the recommended execution surface, and the loop capabilities that are missing.
 
+A SEPARATE mode `--rhinocommon-probe` (distinct from the MCP-name classification above) emits a
+RhinoCommon python snippet to be run via `execute_rhinoscript_python_code`. It uses `hasattr` to
+probe whether *fragile* RhinoCommon methods exist in THIS Rhino build (they vary by Rhino version),
+and prints a capability map back. This answers a different question than `classify()`: classify
+tells you which MCP *server flavor* is connected; the probe tells you which RhinoCommon *methods*
+are present so a missing method can DEGRADE VISIBLY (shell_degraded) instead of silently failing.
+
 Stdlib only. No third-party imports. Passes `python3 -m py_compile`.
 """
 
@@ -70,6 +77,88 @@ RHINOMCP_MARKERS = frozenset({
 
 # Ops with NO typed tool anywhere -> must always go through an exec hatch (conventions §11).
 EXEC_ONLY_OPS = ("revolve", "shell", "network surface")
+
+
+# --- RhinoCommon method-availability probe (E4: missing method) --------------------------
+# These RhinoCommon members are FRAGILE: their presence/overloads vary across Rhino builds, and
+# a call to a missing member fails inside execute_rhinoscript_python_code with an AttributeError
+# that — without this probe — looks like an unrelated geometry failure. The probe is emitted as a
+# standalone RhinoCommon snippet (NOT run here; this env has no Rhino) and printed for the caller
+# to feed to execute_rhinoscript_python_code. It returns a capability map keyed by these labels.
+# Each entry: (capability_label, owner_expression, member_name, degraded_fallback_note).
+RHINOCOMMON_PROBE_TARGETS = (
+    ("brep_create_offset",
+     "Rhino.Geometry.Brep", "CreateOffset",
+     "shell via Brep.CreateOffset missing -> loft between inner+outer profiles / manual "
+     "shell, tag shell_degraded:true (geometry-ops.md method-availability table)"),
+    ("rev_surface_create",
+     "Rhino.Geometry.RevSurface", "Create",
+     "revolve via RevSurface.Create missing -> sweep the profile on a circular rail / "
+     "Brep.CreatePipe approximation, tag shell_degraded:true"),
+    ("nurbs_network_surface",
+     "Rhino.Geometry.NurbsSurface", "CreateNetworkSurface",
+     "network surface missing -> CreateFromLoft across the U-family then trim, or "
+     "Brep.CreatePatch, tag shell_degraded:true"),
+    ("brep_create_offset_solid_overload",
+     "Rhino.Geometry.Brep", "CreateOffset",
+     "the (brep, distance, solid, extend, tol) solid overload may be absent even when "
+     "CreateOffset exists -> wrap in try/except and fall back to a manual two-shell loft, "
+     "tag shell_degraded:true"),
+)
+
+
+def build_rhinocommon_probe():
+    """Emit a RhinoCommon python snippet that probes fragile-method availability in THIS build.
+
+    SEPARATE code path from classify(): classify() reasons over MCP tool NAMES; this reasons over
+    RhinoCommon MEMBER presence. The emitted snippet is meant to be sent to
+    execute_rhinoscript_python_code (it cannot run in this stdlib-only environment). It uses
+    hasattr against the live Rhino assembly and prints a JSON capability map to stdout — the only
+    channel that re-enters the agent's context.
+    """
+    # Build the probe table as a literal the emitted snippet carries inline, so the snippet is
+    # self-contained (no argument passing into execute_rhinoscript_python_code).
+    rows = []
+    for label, owner, member, note in RHINOCOMMON_PROBE_TARGETS:
+        rows.append('    ("%s", %s, "%s", %s),'
+                    % (label, owner, member, json.dumps(note)))
+    table_src = "\n".join(rows)
+
+    snippet = '''#! python3
+# rhinocommon-probe (detect_server.py --rhinocommon-probe): does THIS Rhino build expose the
+# fragile RhinoCommon methods we depend on? Run via execute_rhinoscript_python_code. Prints a
+# JSON capability map; a False entry means the op must DEGRADE VISIBLY (shell_degraded:true),
+# never silently roll back. No third-party imports.
+import json
+import Rhino
+
+# (capability_label, owner_type, member_name, degraded_fallback_note)
+_PROBE = [
+%s
+]
+
+caps = {}
+for label, owner, member, note in _PROBE:
+    present = hasattr(owner, member)
+    caps[label] = {
+        "present": bool(present),
+        "owner": owner.__name__ if hasattr(owner, "__name__") else str(owner),
+        "member": member,
+        "degraded_fallback": note,
+    }
+
+# Probe the Brep.CreateOffset SOLID overload specifically: hasattr can be True while the
+# (brep, dist, solid, extend, tol) overload is absent in this build. A bound-method/overload
+# inspection is build-dependent, so we report the member's presence and leave the overload
+# resolution to a guarded try/except at call time (documented in the fallback note).
+result = {
+    "rhinocommon_probe": True,
+    "capabilities": caps,
+    "rhino_version": str(getattr(Rhino, "RhinoVersion", "unknown")),
+}
+print(json.dumps(result))
+''' % table_src
+    return snippet
 
 
 def _parse_tools(argv):
@@ -266,6 +355,13 @@ def render_report(result):
 
 
 def main(argv):
+    # --- SEPARATE MODE: emit the RhinoCommon method-availability probe ---------------------
+    # Distinct code path from classify(): no tool parsing, no flavor heuristics. Just prints the
+    # RhinoCommon snippet the caller feeds to execute_rhinoscript_python_code.
+    if "--rhinocommon-probe" in argv:
+        sys.stdout.write(build_rhinocommon_probe())
+        return 0
+
     want_json = "--json" in argv
     tools = _parse_tools(argv)
     if not tools:

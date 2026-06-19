@@ -22,6 +22,14 @@ The contract rules checked (mirroring conventions.md section 5):
   7. Post-boolean expected-count + total-volume check (C2).
   8. Name + SetUserString("part_id", ...) + layer at bake (C1).
   9. AddBrep (etc.) returns a GUID and a single Views.Redraw() at the end.
+ 10. DIRECTION-PIN (conventions §5a): any directional constructor
+     (Extrusion.Create / Surface.CreateExtrusion / RevSurface.Create /
+     Brep.CreateFromRevSurface / Curve.CreateExtrusion) must be accompanied, in
+     the same snippet, by a GetBoundingBox( read AND a pin (a .Max.Z/.Min.Z read
+     co-occurring with Transform.Translation/.Translate()). Without the pin the
+     extrusion/revolve trusts the curve normal and silently lands the part at the
+     wrong Z (the realized "seat extruded to 410 not 450" defect) while the count
+     still passes -> FAIL.
 
 Exit code: 0 if no FAIL findings, 1 if any FAIL finding, 2 on usage error.
 No third-party imports.
@@ -80,6 +88,20 @@ RE_PREFLIGHT = re.compile(
     r"ChangeClosedCurveSeam|TangentAtStart|GetNextDiscontinuity|"
     r"IsClosed\b|IsPlanar\s*\(|preflight"
 )
+
+# --- RULE 10: DIRECTION-PIN (conventions §5a) ---------------------------------
+# Directional constructors whose output direction comes from the curve normal/
+# tangent and is therefore NOT trustworthy (extrudes/revolves the wrong way).
+RE_DIRECTIONAL = re.compile(
+    r"\b(?:Extrusion\.Create|Surface\.CreateExtrusion|RevSurface\.Create|"
+    r"Brep\.CreateFromRevSurface|Curve\.CreateExtrusion)\b"
+)
+# The bbox read that the pin reads the realized Z from.
+RE_BBOX_READ = re.compile(r"\.GetBoundingBox\s*\(")
+# The intended-face read: a Min.Z / Max.Z off the bbox.
+RE_BBOX_ZFACE = re.compile(r"\.(?:Max|Min)\.Z\b")
+# The translate that actually pins the part onto the IR-intended plane.
+RE_PIN_TRANSLATE = re.compile(r"Transform\.Translation\s*\(|\.Translate\s*\(")
 
 
 class Finding(object):
@@ -271,6 +293,33 @@ def lint(text):
         else:
             findings.append(Finding("WARN", "9-guid",
                                     "Add* return value not captured; capture the GUID"))
+
+    # Rule 10: direction-pin on directional ops (conventions §5a) --------------
+    # A directional constructor extrudes/revolves along the curve's own normal,
+    # which is NOT trustworthy. Without a GetBoundingBox read AND a pin (a Max.Z/
+    # Min.Z read paired with a Transform.Translation/.Translate), the part can
+    # land at the wrong Z while the object count still passes.
+    if RE_DIRECTIONAL.search(code):
+        has_bbox = bool(RE_BBOX_READ.search(code))
+        has_zface = bool(RE_BBOX_ZFACE.search(code))
+        has_translate = bool(RE_PIN_TRANSLATE.search(code))
+        has_pin = has_zface and has_translate
+        if has_bbox and has_pin:
+            findings.append(Finding("PASS", "10-direction-pin",
+                                    "directional op pinned: GetBoundingBox read + "
+                                    "Max.Z/Min.Z anchored via Transform.Translation (§5a)"))
+        else:
+            miss = []
+            if not has_bbox:
+                miss.append("GetBoundingBox( read")
+            if not has_zface:
+                miss.append(".Max.Z/.Min.Z anchor read")
+            if not has_translate:
+                miss.append("Transform.Translation/.Translate pin")
+            findings.append(Finding("FAIL", "10-direction-pin",
+                                    "directional op not pinned to the IR-intended Z "
+                                    "(§5a; silent wrong-Z, e.g. seat at 410 not 450): "
+                                    "missing " + ", ".join(miss)))
 
     return findings
 
