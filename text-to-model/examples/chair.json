@@ -1,0 +1,165 @@
+{
+  "object": "four-legged dining chair",
+  "units": "mm",
+  "tolerance": 0.01,
+  "world_frame": "WorldXY",
+  "scale": {
+    "value_source": "stated",
+    "overall_height_mm": 880,
+    "confidence": "high",
+    "provenance": "prompt: dining chair, 450mm seat height, 880mm overall back height"
+  },
+  "symmetry": [
+    {
+      "type": "mirror",
+      "plane": "WorldYZ",
+      "origin": [0, 0, 0]
+    }
+  ],
+  "params": {
+    "seat_height": 450,
+    "seat_thickness": 40,
+    "seat_width": 420,
+    "seat_depth": 420,
+    "leg_radius": 18,
+    "leg_inset": 180,
+    "back_height": 450,
+    "back_thickness": 40,
+    "overall_height": 880,
+    "join_penetration": 1.5
+  },
+  "parts": [
+    {
+      "id": "seat",
+      "layer": "chair_seat",
+      "provenance": "prompt: square seat slab at 450mm seat height",
+      "primitive": "box",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [0, 0, 430]
+      },
+      "dims": { "x": 420, "y": 420, "z": 40 }
+    },
+    {
+      "id": "leg_front_right",
+      "layer": "chair_legs",
+      "provenance": "prompt: four cylindrical legs; front-right instance",
+      "primitive": "cylinder",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [180, 180, 0]
+      },
+      "dims": { "radius": 18, "height": 411.5 },
+      "relations": [
+        { "type": "interpenetrate", "to": "seat", "penetration": 1.5 }
+      ]
+    },
+    {
+      "id": "leg_front_left",
+      "layer": "chair_legs",
+      "provenance": "prompt: four cylindrical legs; front-left instance (mirror of front-right about WorldYZ)",
+      "primitive": "cylinder",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [-180, 180, 0]
+      },
+      "dims": { "radius": 18, "height": 411.5 },
+      "relations": [
+        { "type": "interpenetrate", "to": "seat", "penetration": 1.5 },
+        { "type": "symmetric_about", "to": "WorldYZ" }
+      ]
+    },
+    {
+      "id": "leg_back_right",
+      "layer": "chair_legs",
+      "provenance": "prompt: four cylindrical legs; back-right instance",
+      "primitive": "cylinder",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [180, -180, 0]
+      },
+      "dims": { "radius": 18, "height": 411.5 },
+      "relations": [
+        { "type": "interpenetrate", "to": "seat", "penetration": 1.5 }
+      ]
+    },
+    {
+      "id": "leg_back_left",
+      "layer": "chair_legs",
+      "provenance": "prompt: four cylindrical legs; back-left instance (mirror of back-right about WorldYZ)",
+      "primitive": "cylinder",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [-180, -180, 0]
+      },
+      "dims": { "radius": 18, "height": 411.5 },
+      "relations": [
+        { "type": "interpenetrate", "to": "seat", "penetration": 1.5 },
+        { "type": "symmetric_about", "to": "WorldYZ" }
+      ]
+    },
+    {
+      "id": "back",
+      "layer": "chair_back",
+      "provenance": "prompt: vertical backrest rising from the rear edge of the seat",
+      "primitive": "box",
+      "frame": {
+        "plane": "WorldXY",
+        "origin": [0, -190, 655]
+      },
+      "dims": { "x": 420, "y": 40, "z": 450 },
+      "relations": [
+        { "type": "interpenetrate", "to": "seat", "penetration": 1.5 },
+        { "type": "on_top_of", "to": "seat" }
+      ]
+    },
+    {
+      "id": "chair_solid",
+      "layer": "chair",
+      "provenance": "single welded chair solid: seat + 4 legs + back unioned",
+      "operation": "boolean",
+      "op": "union",
+      "inputs": [
+        "seat",
+        "leg_front_right",
+        "leg_front_left",
+        "leg_back_right",
+        "leg_back_left",
+        "back"
+      ],
+      "result": "chair_solid"
+    }
+  ],
+  "boolean_plan": [
+    {
+      "op": "union",
+      "inputs": [
+        "seat",
+        "leg_front_right",
+        "leg_front_left",
+        "leg_back_right",
+        "leg_back_left",
+        "back"
+      ],
+      "result": "chair_solid"
+    }
+  ],
+  "verify": {
+    "binary_questions": [
+      "Is the red seat above the blue legs?",
+      "Is the green backrest behind and above the red seat?",
+      "Do all four legs reach the ground plane?",
+      "Does the silhouette read as a four-legged dining chair?"
+    ],
+    "numeric_checks": [
+      { "metric": "overall_height", "expect": 880, "tol": 5 },
+      { "metric": "bbox_z", "expect": 880, "tol": 5 },
+      { "metric": "seat_height", "expect": 450, "tol": 5 },
+      { "metric": "solid_count", "expect": 1, "tol": 0 }
+    ],
+    "ratio_checks": [
+      { "metric": "seat_height/overall_height", "expect": 0.511, "tol": 0.03 }
+    ],
+    "compare_to_reference": false
+  }
+}

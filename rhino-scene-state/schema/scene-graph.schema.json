@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rhino-skills/rhino-scene-state/schema/scene-graph.schema.json",
+  "title": "Rhino Scene-Graph Artifact",
+  "description": "Externalized world model owned by the rhino-scene-state skill. It is the canonical, re-read-every-step record of what actually exists in the live Rhino document: a part_id -> GUID ledger plus a bbox/dimension ledger, and the realized spatial relations between parts. It is the realized counterpart to the build-plan IR (shared/build-plan.schema.json): the IR declares intent, the scene-graph records the baked truth captured at bake time. Producers append GUIDs out-of-band here; the reconcile loop diffs this artifact's nodes against a live document summary to flag MISSING / EXTRA / MIS-SIZED parts and post-boolean count/volume mismatches (corrections C1 and C2).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["object", "units", "tolerance", "nodes"],
+  "properties": {
+    "object": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Plain-language name of the modeled object, copied from the build-plan IR 'object' field for provenance and verify questions."
+    },
+    "units": {
+      "type": "string",
+      "enum": ["mm", "cm", "m", "in", "ft"],
+      "description": "Document unit system, copied from the IR. Every bbox/dims/origin number in this artifact is in these units. Must match sc.doc.ModelUnitSystem at bake time."
+    },
+    "tolerance": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Absolute model tolerance in 'units', copied from the IR / read live off sc.doc.ModelAbsoluteTolerance. Used as the default bbox/dimension match tolerance during reconcile unless overridden per-node."
+    },
+    "world_frame": {
+      "type": "string",
+      "default": "WorldXY",
+      "description": "Named base construction plane all node local frames are relative to. Default WorldXY."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonically increasing artifact revision, bumped after every mutation cycle so re-reads can detect staleness."
+    },
+    "last_op": {
+      "type": "string",
+      "description": "Short label of the most recent mutation that produced this revision, e.g. 'boolean_union:seat+legs' or 'bake:leg[2]'. Aids the reconcile report and debugging."
+    },
+    "nodes": {
+      "type": "array",
+      "description": "Realized parts. Each node mirrors one build-plan IR part (by part_id) and records its baked GUID, world-axis-aligned bounding box, and key dimensions captured from the live document.",
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Realized spatial/logical relations between nodes, mirroring the IR relation set. Each edge names a relation type and its two endpoint part_ids.",
+      "items": { "$ref": "#/$defs/edge" }
+    }
+  },
+  "$defs": {
+    "point3d": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[x, y, z] in document 'units' against world_frame."
+    },
+    "bbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "description": "World-axis-aligned bounding box captured from the baked geometry via Rhino.Geometry.BoundingBox (GetBoundingBox(True)). min and max are opposite corners in 'units'.",
+      "properties": {
+        "min": { "$ref": "#/$defs/point3d", "description": "Minimum corner [x,y,z]." },
+        "max": { "$ref": "#/$defs/point3d", "description": "Maximum corner [x,y,z]." }
+      }
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin"],
+      "description": "The local construction frame the part was authored on, copied from the IR part.frame. Lets a re-read reconstruct where the part lives without re-querying geometry.",
+      "properties": {
+        "origin": { "$ref": "#/$defs/point3d", "description": "Frame origin in 'units' against world_frame." },
+        "plane": {
+          "type": "string",
+          "description": "Named target plane (WorldXY, WorldYZ, WorldZX/WorldXZ, or a custom frame name) the part was relocated onto."
+        },
+        "x_axis": { "$ref": "#/$defs/point3d", "description": "Optional explicit plane X axis vector." },
+        "y_axis": { "$ref": "#/$defs/point3d", "description": "Optional explicit plane Y axis vector." }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One realized part. MUST carry at least one stable handle: a 'guid' (the canonical Rhino reference) OR a 'part_id' (the UserString fallback resolver, correction C1). In steady state both are present; immediately after a mutator that has not yet returned its GUID, part_id alone is permitted and the reconcile loop backfills the guid.",
+      "required": ["bbox"],
+      "anyOf": [
+        { "required": ["guid"] },
+        { "required": ["part_id"] }
+      ],
+      "properties": {
+        "part_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable part identifier, identical to the IR part.id and to the baked object's UserString 'part_id'. The fallback resolver when a GUID is lost (e.g. after a boolean consumes inputs)."
+        },
+        "guid": {
+          "type": "string",
+          "description": "The Rhino System.Guid returned by AddBrep/AddCurve/AddSurface at bake time, as a string. The canonical object handle (correction C1). May be the unset GUID string only transiently before backfill.",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Rhino object Name (human-readable in the object table), set equal to part_id at bake time."
+        },
+        "layer": {
+          "type": "string",
+          "description": "Target Rhino layer name the object lives on, mirroring the IR part.layer."
+        },
+        "primitive": {
+          "type": "string",
+          "description": "How the geometry was produced: a primitive type ('box','cylinder','sphere','cone','plane','interpolated_curve') or an operation result ('loft','sweep1','revolve','extrude','shell','boolean'). Free-form to allow operation results."
+        },
+        "frame": { "$ref": "#/$defs/frame", "description": "Local construction frame the part was authored on (copied from the IR)." },
+        "bbox": { "$ref": "#/$defs/bbox", "description": "World-axis-aligned bounding box captured from the live baked geometry." },
+        "dims": {
+          "type": "object",
+          "description": "Key realized dimensions in 'units', e.g. {x,y,z} for a box, {radius,height} for a cylinder, or {width,depth,height} derived from the bbox. Used by reconcile MIS-SIZED checks.",
+          "additionalProperties": { "type": "number" }
+        },
+        "volume": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Realized solid volume in 'units^3' from Rhino.Geometry.VolumeMassProperties.Compute, when the node is a closed solid. Used by the post-boolean total-volume check (correction C2). Omitted for open curves/surfaces."
+        },
+        "is_solid": {
+          "type": "boolean",
+          "description": "Whether the baked Brep is a closed solid (Brep.IsSolid). Open curves/surfaces are false."
+        },
+        "expected_solid_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For boolean/operation results: how many disjoint solids the result SHOULD contain per the IR boolean_plan. The reconcile loop compares this to the realized count to catch partial boolean failure (correction C2)."
+        },
+        "provenance": {
+          "type": "string",
+          "description": "Why this part exists / where its shape came from, copied from the IR part.provenance."
+        },
+        "color": {
+          "type": "string",
+          "description": "Optional vision color assigned for a colored-part capture (correction C4), e.g. 'red' or '255,0,0'. A render concern, not an identity concern."
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "from", "to"],
+      "description": "A realized relation between two nodes, mirroring an IR relation. For 'interpenetrate' edges (union joins) the realized overlap depth is recorded in 'penetration' for the correction-C3 check.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate"],
+          "description": "Relation kind. 'child_of' models an operation result owning its consumed inputs; 'interpenetrate' models a union join overlap."
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "part_id of the node this relation is anchored on."
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "description": "part_id of the other node, or a symmetry/frame name for 'symmetric_about'."
+        },
+        "penetration": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Realized overlap depth in 'units' (target 0.5-2mm) for 'interpenetrate' edges feeding a boolean union (correction C3). Required for interpenetrate edges."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "interpenetrate" } } },
+          "then": { "required": ["penetration"] }
+        }
+      ]
+    }
+  }
+}

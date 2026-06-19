@@ -1,0 +1,372 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rhino-skills/shared/build-plan.schema.json",
+  "title": "Rhino Build-Plan IR",
+  "description": "Validated intermediate representation (IR) shared by the text-to-model, image-to-model and rhino-scene-state skills. It externalizes the full spatial intent of a model so the LLM can re-read world state each step instead of holding it in context. Every numeric value is expressed in the document 'units' against the named 'world_frame'. Producers (text-to-model, image-to-model) write 'object'..'verify'; rhino-scene-state appends realized GUIDs out-of-band in the scene-graph artifact, not here. The build pipeline reads this IR to emit guarded geometry codegen and to drive the render+measure+repair loop.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["object", "units", "tolerance", "parts"],
+  "properties": {
+    "object": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Plain-language name of the thing being modeled, e.g. 'four-legged dining chair'. Used in verify binary_questions and in part provenance."
+    },
+    "units": {
+      "type": "string",
+      "enum": ["mm", "cm", "m", "in", "ft"],
+      "description": "Document unit system. Must be set on sc.doc BEFORE any geometry is created. Every dims/origin/penetration/height number in this IR is in these units."
+    },
+    "tolerance": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Absolute model tolerance in 'units'. At runtime always prefer the live sc.doc.ModelAbsoluteTolerance; this value is the IR's intended tolerance for join/offset/boolean operations and for naked-edge checks."
+    },
+    "world_frame": {
+      "type": "string",
+      "default": "WorldXY",
+      "description": "Named base construction plane that all part frames are relative to. Default WorldXY. Parts relocate from Plane.WorldXY to their target plane via Transform.PlaneToPlane."
+    },
+    "scale": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How absolute size was determined. Text pipeline typically value_source='stated' with high confidence; image pipeline typically 'reference_object' or 'metrology_assumption' with a range + medium/low confidence, which forces the verify loop onto scale-invariant ratio_checks only (correction C5).",
+      "required": ["value_source", "overall_height_mm", "confidence"],
+      "properties": {
+        "value_source": {
+          "type": "string",
+          "enum": ["stated", "reference_object", "metrology_assumption"],
+          "description": "stated = a real dimension was given in the prompt (verify absolutes). reference_object = scaled off a known object in an image (carry confidence). metrology_assumption = a category default was assumed (lowest trust)."
+        },
+        "overall_height_mm": {
+          "description": "Overall bounding height in millimetres. A single number when known, or a [min,max] inclusive range when scale is uncertain (image pipeline). Always mm regardless of document 'units'.",
+          "oneOf": [
+            { "type": "number", "exclusiveMinimum": 0 },
+            {
+              "type": "array",
+              "items": { "type": "number", "exclusiveMinimum": 0 },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "[min, max] inclusive range; max must be >= min (enforced in producer)."
+            }
+          ]
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["high", "medium", "low"],
+          "description": "Confidence in the absolute scale. low/medium => verify loop fires repairs on ratio_checks only, never on absolute numeric_checks."
+        },
+        "provenance": {
+          "type": "string",
+          "description": "Where the scale came from, e.g. 'prompt: 450mm seat height' or 'reference: A4 sheet 297mm in image'."
+        },
+        "assumption": {
+          "type": "string",
+          "description": "The explicit assumption made when value_source='metrology_assumption', e.g. 'standard dining chair seat height ~450mm'."
+        }
+      }
+    },
+    "symmetry": {
+      "type": "array",
+      "description": "Declared symmetries of the object. Used both to reduce part authoring (mirror/array) and to generate symmetry verify questions.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "origin"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["mirror", "rotational"],
+            "description": "mirror requires 'plane'; rotational requires 'axis'."
+          },
+          "plane": {
+            "type": "string",
+            "description": "Mirror plane, e.g. 'WorldYZ' or a named frame. Required when type='mirror'."
+          },
+          "axis": {
+            "type": "string",
+            "description": "Rotational axis, e.g. 'WorldZ'. Required when type='rotational'."
+          },
+          "origin": {
+            "$ref": "#/$defs/point3d",
+            "description": "Origin point of the symmetry plane/axis in 'units' against world_frame."
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 2,
+            "description": "Number of instances around a rotational axis (optional, rotational only)."
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "type": { "const": "mirror" } } },
+            "then": { "required": ["plane"] }
+          },
+          {
+            "if": { "properties": { "type": { "const": "rotational" } } },
+            "then": { "required": ["axis"] }
+          }
+        ]
+      }
+    },
+    "params": {
+      "type": "object",
+      "description": "Named scalar parameters that parts/relations reference symbolically (e.g. 'seat_height', 'leg_radius'). Keeps proportions consistent and makes ratio_checks computable. All values are plain numbers in 'units'.",
+      "additionalProperties": { "type": "number" }
+    },
+    "parts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered list of parts. Each part is EITHER a primitive (has 'primitive') OR an operation (has 'operation'), never both. Operations may consume earlier parts by id via their input fields.",
+      "items": { "$ref": "#/$defs/part" }
+    },
+    "boolean_plan": {
+      "type": "array",
+      "description": "Explicit, ordered boolean execution plan. Each step names an op, the input part ids, and the id of the resulting part. Mirrors any boolean operation parts but gives the executor a single linear sequence to run and to volume-check (correction C2).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["op", "inputs", "result"],
+        "properties": {
+          "op": { "type": "string", "enum": ["union", "difference", "intersection"] },
+          "inputs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 2,
+            "description": "Part ids consumed by this boolean. For difference, inputs[0] is the base; the rest are subtracted."
+          },
+          "result": { "type": "string", "description": "Part id of the boolean result." }
+        }
+      }
+    },
+    "verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Acceptance criteria evaluated by render-and-look + analyze_objects. binary_questions and compare_to_reference go to vision (profile fidelity / 'looks like X'); numeric_checks and ratio_checks go to bbox/analyze math (vision-demotion, correction C4).",
+      "properties": {
+        "binary_questions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Yes/no questions answered by colored-part vision, e.g. 'is the red seat above the blue legs?'. Phrase so the answer depends on relative position/color, not measured size."
+        },
+        "numeric_checks": {
+          "type": "array",
+          "description": "Absolute measurements (only trustworthy when scale.confidence=high, i.e. text pipeline).",
+          "items": { "$ref": "#/$defs/check" }
+        },
+        "ratio_checks": {
+          "type": "array",
+          "description": "Scale-invariant ratios (e.g. seat_height/overall_height). The ONLY checks the image pipeline may fire repairs on (correction C5).",
+          "items": { "$ref": "#/$defs/check" }
+        },
+        "compare_to_reference": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, render-and-look diffs the rendered model against the reference image/silhouette (image pipeline)."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "point3d": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[x, y, z] in document 'units' against world_frame."
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Explicit construction plane a part is built on. The part is authored on Plane.WorldXY then moved to this frame via Transform.PlaneToPlane.",
+      "required": ["origin"],
+      "properties": {
+        "origin": { "$ref": "#/$defs/point3d" },
+        "plane": {
+          "type": "string",
+          "description": "Named target plane, e.g. 'WorldXY', 'WorldYZ', 'WorldXZ', or a custom frame name resolved by the executor. Default WorldXY when omitted."
+        },
+        "x_axis": { "$ref": "#/$defs/point3d", "description": "Optional explicit plane X axis vector." },
+        "y_axis": { "$ref": "#/$defs/point3d", "description": "Optional explicit plane Y axis vector." }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "expect", "tol"],
+      "properties": {
+        "metric": {
+          "type": "string",
+          "description": "Computable metric name, e.g. 'overall_height', 'solid_count', 'total_volume', 'seat_height/overall_height'."
+        },
+        "expect": {
+          "description": "Expected value: a number for numeric_checks, or a number/ratio for ratio_checks.",
+          "type": "number"
+        },
+        "tol": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Acceptance tolerance for |measured - expect|, in 'units' for numeric_checks or absolute ratio delta for ratio_checks."
+        }
+      }
+    },
+    "axis_line": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An axis expressed as two points (revolve axis, etc). Must be coplanar with the revolve profile (correction C7).",
+      "required": ["line"],
+      "properties": {
+        "line": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/point3d" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[[x0,y0,z0],[x1,y1,z1]] start and end of the axis."
+        }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "description": "A spatial/logical relation between this part and another. 'penetration' is REQUIRED when type='interpenetrate' (parts feeding a boolean union must overlap 0.5-2mm, correction C3).",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["coincident", "on_top_of", "symmetric_about", "child_of", "interpenetrate"]
+        },
+        "this": { "type": "string", "description": "Part id this relation is anchored on (defaults to the owning part)." },
+        "to": { "type": "string", "description": "The other part id (or symmetry/frame name for symmetric_about)." },
+        "penetration": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Overlap depth in 'units' (typically 0.5-2mm) for interpenetrate relations feeding a boolean union. Coincident/coplanar contact is degenerate and forbidden for unions."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "interpenetrate" } } },
+          "then": { "required": ["penetration", "to"] }
+        }
+      ]
+    },
+    "part": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "description": "A primitive part (has 'primitive') or an operation part (has 'operation'). Exactly one of those two keys must be present.",
+      "oneOf": [
+        { "required": ["primitive"] },
+        { "required": ["operation"] }
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable part identifier. Becomes the UserString 'part_id' on the baked object and the scene-graph key mapping to its GUID (correction C1)."
+        },
+        "layer": { "type": "string", "description": "Target Rhino layer name." },
+        "provenance": { "type": "string", "description": "Why this part exists / where its shape came from (prompt phrase, reference silhouette, archetype profile)." },
+        "primitive": {
+          "type": "string",
+          "enum": ["box", "cylinder", "sphere", "cone", "plane", "interpolated_curve"],
+          "description": "Primitive type. 'interpolated_curve' builds a Curve.CreateInterpolatedCurve through control_points (used as loft sections / sweep rails / revolve generatrices)."
+        },
+        "frame": { "$ref": "#/$defs/frame", "description": "Construction frame for a primitive part." },
+        "dims": {
+          "type": "object",
+          "description": "Primitive dimensions in 'units', e.g. box {x,y,z}, cylinder {radius,height}, sphere {radius}, cone {radius,height}, plane {x,y}. Keys depend on 'primitive'.",
+          "additionalProperties": { "type": "number" }
+        },
+        "control_points": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/point3d" },
+          "minItems": 2,
+          "description": "Ordered control/interpolation points for 'interpolated_curve' (and reusable as section/rail/generatrix geometry)."
+        },
+        "count": { "type": "integer", "minimum": 1, "description": "Number of instances of this part (e.g. 4 legs)." },
+        "instances": {
+          "type": "array",
+          "description": "Explicit per-instance frames when 'count' instances are not a simple array.",
+          "items": { "$ref": "#/$defs/frame" }
+        },
+        "instances_at": {
+          "type": "array",
+          "description": "Explicit instance origin points (shorthand for instances with default plane).",
+          "items": { "$ref": "#/$defs/point3d" }
+        },
+        "operation": {
+          "type": "string",
+          "enum": ["loft", "sweep1", "revolve", "extrude", "shell", "boolean"],
+          "description": "Operation type. Each requires its own fields below."
+        },
+        "generatrix": {
+          "type": "string",
+          "description": "Part id of the profile curve to revolve (revolve). Must touch the revolve axis at start AND end, or be closed (correction C6)."
+        },
+        "axis": { "$ref": "#/$defs/axis_line", "description": "Revolve axis as a two-point line, coplanar with the generatrix (revolve)." },
+        "angle_deg": { "type": "number", "description": "Revolve sweep angle in degrees (revolve; 360 for full)." },
+        "sections": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 2,
+          "description": "Ordered part ids of section curves to loft through (loft). All must run the same direction and be seam-aligned (correction C7)."
+        },
+        "rail": { "type": "string", "description": "Part id of the rail curve (sweep1). Must be G1 continuous (correction C7)." },
+        "height": { "type": "number", "description": "Extrusion distance in 'units' (extrude)." },
+        "thickness": { "type": "number", "description": "Shell wall thickness in 'units' (shell). Must be < min feature size; brep must be closed/capped before shelling (correction C6)." },
+        "open_face": {
+          "description": "Face index, or list of face indices, left open by the shell (shell).",
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+          ]
+        },
+        "cap": { "type": "boolean", "description": "Whether to cap the result into a closed solid (revolve/extrude/sweep1). Required before shell." },
+        "op": {
+          "type": "string",
+          "enum": ["union", "difference", "intersection"],
+          "description": "Boolean operator (operation='boolean')."
+        },
+        "inputs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Part ids consumed by this operation (boolean/loft/extrude inputs). For boolean difference, inputs[0] is the base."
+        },
+        "result": { "type": "string", "description": "Part id of the operation result (defaults to this part's own id)." },
+        "relations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/relation" },
+          "description": "Relations this part has to others. Union inputs must declare an 'interpenetrate' relation with a penetration depth (correction C3)."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "revolve" } }, "required": ["operation"] },
+          "then": { "required": ["generatrix", "axis"] }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "loft" } }, "required": ["operation"] },
+          "then": { "required": ["sections"] }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "sweep1" } }, "required": ["operation"] },
+          "then": { "required": ["rail", "sections"] }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "extrude" } }, "required": ["operation"] },
+          "then": { "required": ["inputs", "height"] }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "shell" } }, "required": ["operation"] },
+          "then": { "required": ["inputs", "thickness"] }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "boolean" } }, "required": ["operation"] },
+          "then": { "required": ["op", "inputs"] }
+        }
+      ]
+    }
+  }
+}

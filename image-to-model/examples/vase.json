@@ -1,0 +1,94 @@
+{
+  "object": "ceramic table vase (solid of revolution, hollow)",
+  "units": "mm",
+  "tolerance": 0.01,
+  "world_frame": "WorldXY",
+  "scale": {
+    "value_source": "metrology_assumption",
+    "overall_height_mm": [250, 350],
+    "confidence": "low",
+    "provenance": "no scale cue in reference image; no known reference object in frame",
+    "assumption": "decorative ceramic table vase, typical overall height 250-350mm; built at range midpoint 300mm"
+  },
+  "symmetry": [
+    {
+      "type": "rotational",
+      "axis": "WorldZ",
+      "origin": [0, 0, 0]
+    }
+  ],
+  "params": {
+    "overall_height": 300,
+    "max_width": 180,
+    "wall_thickness": 4,
+    "neck_radius": 27
+  },
+  "parts": [
+    {
+      "id": "vase_profile",
+      "layer": "profile",
+      "provenance": "averaged left+right silhouette from reference image via extract_profile.py; ogee_vase archetype confirmed by render-vs-reference loop; control points start and end on the revolve axis (C6)",
+      "primitive": "interpolated_curve",
+      "frame": {
+        "origin": [0, 0, 0],
+        "plane": "WorldXZ"
+      },
+      "control_points": [
+        [0, 0, 0],
+        [54, 0, 0],
+        [60, 0, 24],
+        [86, 0, 84],
+        [90, 0, 135],
+        [63, 0, 198],
+        [40, 0, 246],
+        [27, 0, 285],
+        [29, 0, 300],
+        [0, 0, 300]
+      ]
+    },
+    {
+      "id": "vase_solid",
+      "layer": "vase",
+      "provenance": "solid of revolution: vase_profile spun 360 degrees about WorldZ, then capped into a closed solid (C6)",
+      "operation": "revolve",
+      "generatrix": "vase_profile",
+      "axis": {
+        "line": [
+          [0, 0, 0],
+          [0, 0, 300]
+        ]
+      },
+      "angle_deg": 360,
+      "cap": true
+    },
+    {
+      "id": "vase_hollow",
+      "layer": "vase",
+      "provenance": "hollow the capped revolve solid into a thin-walled vessel, leaving the top face open (C6: cap before shell, closed brep required by Brep.CreateOffset solid=true)",
+      "operation": "shell",
+      "inputs": ["vase_solid"],
+      "thickness": 4,
+      "open_face": 1,
+      "result": "vase_hollow"
+    }
+  ],
+  "verify": {
+    "binary_questions": [
+      "Does the rendered silhouette read as a vase (wide belly, narrow neck) like the reference image?",
+      "Is the opening (top) hollow rather than a solid cap?"
+    ],
+    "ratio_checks": [
+      {
+        "metric": "height/max_width",
+        "expect": 1.6667,
+        "tol": 0.15
+      },
+      {
+        "metric": "neck_width/max_width",
+        "expect": 0.3,
+        "tol": 0.08
+      }
+    ],
+    "compare_to_reference": true
+  }
+}

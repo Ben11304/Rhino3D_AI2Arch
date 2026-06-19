@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Rhino / Grasshopper local artifacts (not tracked)
+*.3dm
+*.3dmbak
+*.gh
+*.ghx
+rhino_compute_log*.txt
