@@ -114,6 +114,33 @@
       "description": "Named scalar parameters that parts/relations reference symbolically (e.g. 'seat_height', 'leg_radius'). Keeps proportions consistent and makes ratio_checks computable. All values are plain numbers in 'units'.",
       "additionalProperties": { "type": "number" }
     },
+    "stages": {
+      "type": "array",
+      "description": "Ordered build STAGES for scoped, idempotent, checkpointed emit. Each stage names a slice of 'parts' (by part id) that is baked + reconciled as one unit, then checkpointed, before the next stage runs. A part with no stage belongs to an implicit 'default' stage. Stages exist so the double-execution wrapper self-corrects WITHIN a stage (the stage deletes its own objects by tag, then re-creates them once) and so a fragile-op failure or a later edit rebuilds only its stage, never the whole model (see conventions §12).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "parts"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable stage id. Stamped as UserString 'stage' on every object baked in this stage and used as the scoped delete key for idempotent re-emit (conventions §12)."
+          },
+          "parts": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "Ordered part ids built in this stage (a subset of the top-level 'parts'). The same id must not appear in two stages."
+          },
+          "depends_on": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Stage ids that must be baked + checkpointed before this stage (e.g. a 'bell_chamber' stage depends_on 'shaft'). Used to order emit and to know which downstream stages to re-verify after a re-emit."
+          }
+        }
+      }
+    },
     "parts": {
       "type": "array",
       "minItems": 1,
@@ -266,6 +293,7 @@
           "description": "Stable part identifier. Becomes the UserString 'part_id' on the baked object and the scene-graph key mapping to its GUID (correction C1)."
         },
         "layer": { "type": "string", "description": "Target Rhino layer name." },
+        "stage": { "type": "string", "description": "Build stage this part belongs to (conventions §12). Stamped as UserString 'stage' at bake; the scoped idempotent delete key. If the top-level 'stages' array is present it is authoritative; this inline field is a shorthand for plans that don't need explicit stage ordering. A part with neither belongs to the implicit 'default' stage." },
         "provenance": { "type": "string", "description": "Why this part exists / where its shape came from (prompt phrase, reference silhouette, archetype profile)." },
         "primitive": {
           "type": "string",

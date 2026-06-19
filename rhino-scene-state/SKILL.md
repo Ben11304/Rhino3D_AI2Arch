@@ -1,7 +1,7 @@
 ---
 name: rhino-scene-state
 user-invocable: false
-description: Maintains the externalized scene-graph world model for the Rhino skill suite — the part_id->GUID ledger plus the bbox/dimension ledger — and reconciles expected-vs-actual after every mutation. Captures each baked object's GUID, name, layer, local frame, bounding box, key dims and volume at bake time; resolves objects GUID-first with a UserString part_id fallback when a boolean consumes inputs; diffs the declared scene-graph against a cheap live document summary to flag MISSING, EXTRA, MIS-SIZED parts and post-boolean count/volume mismatches. Use automatically around every geometry-producing or mutating step (create_object, loft, extrude, sweep1, revolve, shell, boolean_union/difference/intersection, bake). Enforces token economy via get_document_summary aggregates before re-querying full objects.
+description: Maintains the externalized scene-graph world model for the Rhino skill suite — the part_id->GUID ledger plus the bbox/dimension ledger — and reconciles expected-vs-actual after every mutation. Captures each baked object's GUID, name, layer, local frame, bounding box, key dims and volume at bake time; resolves objects GUID-first with a UserString part_id fallback when a boolean consumes inputs; diffs the declared scene-graph against a cheap live document summary to flag MISSING, EXTRA, PHANTOM (untagged), DUPLICATE, MIS-SIZED parts and post-boolean count/volume mismatches, counting authoritatively by part_id rather than the unreliable document object_count. Use automatically around every geometry-producing or mutating step (create_object, loft, extrude, sweep1, revolve, shell, boolean_union/difference/intersection, bake). Enforces token economy via get_document_summary aggregates before re-querying full objects.
 allowed-tools: Bash(python3 *)
 ---
 
@@ -65,28 +65,37 @@ conventions §2 for the canonical `add_and_register` / `find_newest_guid` / `res
 
 Every mutation is bracketed by a cheap aggregate capture before and after, then a structured diff.
 
-1. **Capture-before (cheap).** Call `get_document_summary` for the aggregate object count and the
-   live tolerance/units. Do **not** dump full objects here. Snapshot the GUID set if you need a
-   create-then-find-newest shim.
+1. **Capture-before (cheap).** Call `get_document_summary` for the live tolerance/units and to
+   snapshot the **set of part_ids** (and the GUID set, if you need a create-then-find-newest shim).
+   Do **not** dump full objects here, and do **not** treat the document `object_count` as a count of
+   *your* parts.
 2. **Mutate.** Run the typed MCP geometry tool (preferred) or fall back to `execute_*` only for ops
    with no typed tool (revolve, shell, network surface — conventions §11).
-3. **Capture-after (cheap first).** Call `get_document_summary` again. Compare the aggregate count
-   delta to what the operation should have produced (e.g. a union of 5 solids into 1 should drop the
-   count by 4). Only if the cheap delta is ambiguous, escalate to a **paginated**
-   `get_objects` at this **decision point** with `include_geometry=false` (bbox + volume aggregates
-   are enough), using `offset`/`limit`.
+3. **Capture-after (cheap first).** Call `get_document_summary` again and read `objects_by_type` /
+   the per-object `part_id` (UserString) — **not** the aggregate `object_count`. The authoritative
+   "did the right thing happen?" signal is the change in the set of **tagged part_ids**, never the
+   raw object total: `object_count` has been observed at 54 when only 18 real BREPs existed (E2), so
+   a count delta proves nothing. If `part_id` tags are not in the summary, escalate to a **paginated**
+   `get_objects` at this **decision point** with `include_geometry=false` and read the UserStrings.
 4. **Reconcile.** Run [`scripts/reconcile.py`](scripts/reconcile.py) with the expected scene-graph
-   (derived from the IR) and the actual document summary. It diffs by GUID (falling back to
-   `part_id`/UserString match) and flags:
+   (derived from the IR) and the actual document summary. It **enumerates by `part_id`** (GUID-first,
+   UserString fallback) and asserts on identity, never on `object_count` (which it reports for
+   transparency only). It flags:
    - **MISSING** — a declared node with no matching live object (and no `child_of` edge to explain
      consumption).
-   - **EXTRA** — a live object with no declared node.
+   - **EXTRA** — a **tagged** live object whose `part_id` no declared node claims (or a surplus copy).
+   - **PHANTOM** — an **untagged** live object (no `part_id` UserString): a leftover that inflated
+     `object_count`. Repair hint: delete-untagged (E2). *This is the category that explains 54-vs-18.*
+   - **DUPLICATE** — one declared `part_id` resolved to **more than one** live object: the
+     double/triple-execution signature (E1).
    - **MIS-SIZED** — a matched node whose live bbox span differs from the declared dims beyond
      tolerance.
    - **COUNT / VOLUME mismatch (C2)** — a boolean/operation result whose realized solid count or
-     total volume diverges from `expected_solid_count` / the summed IR volume. A *valid* Brep
-     missing a part (e.g. a 3-legged chair that should have 4) passes `IsValid`/`IsSolid`; only this
-     count+volume guard catches the **partial/silent boolean failure**.
+     total volume diverges from `expected_solid_count` / the summed IR volume. The realized count is
+     read from the object's own `solid_count`/`piece_count`, else from the **part_id-enumeration
+     count** — never from `object_count`. A *valid* Brep missing a part (e.g. a 3-legged chair that
+     should have 4) passes `IsValid`/`IsSolid`; only this count+volume guard catches the
+     **partial/silent boolean failure**.
    The script exits **non-zero on any mismatch**, which gates the pipeline and hands off to
    `rhino-repair`.
 5. **Interpenetration audit (C3).** For every `interpenetrate` edge feeding a union, confirm the
@@ -102,7 +111,38 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/reconcile.py" \
   --tol 0.01
 ```
 
+For a **staged** build (conventions §12), reconcile **per stage** so a re-emitted stage is checked
+against only its own nodes and the rest of the model never registers as EXTRA:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scripts/reconcile.py" \
+  --expected expected_scene_graph.json \
+  --actual   actual_document_summary.json \
+  --stage bell_chamber
+```
+
 Only the script's structured stdout report enters context; its exit code gates the loop.
+
+---
+
+## Scoped idempotent stages + checkpoints (conventions §12)
+
+EMIT is **staged**, and each stage is **scoped-idempotent**: a stage script deletes only the live
+objects tagged with its `stage` (via [`scripts/stage_emit.py`](scripts/stage_emit.py)), then
+re-creates them once. This skill owns the ledger bookkeeping that keeps the scene-graph consistent
+across stages:
+
+1. **Stamp `stage`.** Every baked object carries `UserString "stage"` (alongside `part_id`), and
+   every node records its `stage`. This is the scoped delete key for a re-emit and the `--stage`
+   reconcile filter.
+2. **Replace, don't append, on re-emit.** A stage re-emit purges that stage's live objects and
+   re-bakes them; in the ledger, **drop that stage's old nodes and append the new GUIDs**, then bump
+   `revision` and set `last_op` (e.g. `re-emit:bell_chamber`). Nodes of other stages are untouched.
+3. **Checkpoint at each stage boundary.** When a stage bakes and `reconcile.py --stage <id>` passes,
+   append a `checkpoints[]` entry `{stage, status:"passed", revision, part_ids}` and **Save the
+   .3dm** (MCP save tool / `RhinoDoc.Save`). The checkpoint + save is the **persisted ledger** — a
+   crash, rollback, or fragile-op failure (a missing `Brep.CreateOffset` overload) loses at most the
+   in-flight stage, and the build resumes from the last passing checkpoint rather than from zero.
 
 ---
 

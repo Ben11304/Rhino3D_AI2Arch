@@ -91,6 +91,47 @@ Edges let a re-read answer "is the seat *on top of* the legs?" structurally befo
 
 ---
 
+## 3a. Measurement truth — `object_count` is NEVER authoritative
+
+The document `object_count` (from `get_document_summary`) is a **diagnostic, not a
+signal**. In a real session it reported **54** while only **18** real BREPs existed: a
+double execution plus phantom non-solid leftovers had inflated the total. Trusting that
+number would have declared the build wrong (or right) for the wrong reason.
+
+**Rule:** the authoritative live count is the number of **distinct, correctly-tagged
+part_ids** — objects enumerated by their `UserString "part_id"` (correction C1), *not* the
+document object total. Resolve the realized count in this strict order and never fall back
+to `object_count`:
+
+1. **By part_id (authoritative).** Count distinct `UserString "part_id"` values across the
+   live objects. This is the truth: it ignores untagged leftovers and exposes double-bakes.
+2. **By layer.** When a part_id is absent, the IR `part.layer` partitions objects into the
+   expected layer buckets; a layer holding more objects than its declared parts is a
+   leftover signal.
+3. **By `objects_by_type`.** Only as a coarse last resort (e.g. "how many BREPs vs curves"),
+   never as the per-part identity.
+
+`reconcile.py` consumes this directly. It reports `actual_objects` (the raw `object_count`)
+**for transparency only** and asserts on the part_id-keyed diff, which adds two categories on
+top of MISSING/EXTRA/MIS-SIZED:
+
+| category    | meaning | evidence |
+|-------------|---------|----------|
+| **PHANTOM** | a live object carrying **no** `part_id` UserString — an untagged leftover that inflates `object_count`. Repair hint: delete-untagged. | E2 (54 vs 18) |
+| **DUPLICATE** | one declared `part_id` resolved to **more than one** live object — the double/triple-execution signature. | E1 |
+
+So a summary where `object_count = 54` but the part_id enumeration yields the 18 declared
+ids (and 36 phantoms) is reported as **18 matched + 36 PHANTOM**, not "54 objects, off by
+36 nodes". The scene-graph's identity is `part_id`, and the count follows identity.
+
+> **Per-node count (C2) also comes from identity, not `object_count`.** The post-boolean
+> disjoint-solid count is read from the object's own `solid_count`/`piece_count`; if the cheap
+> summary omits it, reconcile falls back to the **part_id-enumeration count** for that node
+> (how many live objects share the id) rather than silently skipping the check. The aggregate
+> `object_count` is *never* used to derive a per-node count.
+
+---
+
 ## 4. The scene-graph is re-read every step as canonical world state
 
 The whole point of the artifact is that it is **the** source of truth between steps, replacing

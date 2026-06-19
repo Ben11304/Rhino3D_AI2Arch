@@ -9,6 +9,19 @@ Read `tol = sc.doc.ModelAbsoluteTolerance` and
 `ang_tol = sc.doc.ModelAngleToleranceRadians` live; pass them into every
 `Create*`/`Join`/boolean call. Never hardcode `0.001`.
 
+**Emit each op inside a SCOPED IDEMPOTENT STAGE** (conventions §12). Do not emit
+the whole model as one atomic script. Every `execute_*` body is: *(1) the scoped
+purge preamble from
+[`../../rhino-scene-state/scripts/stage_emit.py`](../../rhino-scene-state/scripts/stage_emit.py)
+(`--stage <id>`), which deletes only this stage's tagged objects → (2) the
+per-stage `_stage_before_ids` snapshot → (3) the guarded `Create*`/bake below,
+each bake stamping `attr.SetUserString("stage", <id>)`.* This makes a re-run
+(including the observed double-execution of the wrapper) converge to one copy of
+the stage, and bounds any op failure to its own stage instead of rolling back the
+whole build. A fragile op with no available overload (e.g. a `Brep.CreateOffset`
+shell) then fails one stage, repaired by re-emitting just that stage — never the
+other 900 solids.
+
 A note on silent failure: most of these returns are *arrays that can be empty*
 (`Brep[]`, `Curve[]`) or *single objects that can be `None`*. Empty/`None` is the
 failure signal — there is rarely an exception. After every `Create*` you MUST

@@ -59,11 +59,13 @@ unit_sys = sc.doc.ModelUnitSystem               # Rhino.UnitSystem enum (Millime
 import scriptcontext as sc
 import Rhino
 
-def add_and_register(geom, part_id, layer_index=None):
+def add_and_register(geom, part_id, layer_index=None, stage=None):
     """Bake geometry, return its GUID, and stamp the part_id ledger key."""
     attr = Rhino.DocObjects.ObjectAttributes()
     attr.Name = part_id
     attr.SetUserString("part_id", part_id)
+    if stage is not None:
+        attr.SetUserString("stage", stage)   # scoped idempotent delete key (§12)
     if layer_index is not None:
         attr.LayerIndex = layer_index
     guid = sc.doc.Objects.AddBrep(geom, attr)   # AddBrep/AddCurve/AddSurface return a System.Guid
@@ -96,6 +98,8 @@ Every object must be identifiable three ways, set together at bake time:
 - **Name** = the part_id (human-readable in the Rhino object table).
 - **Layer** = the part's `layer` field, or a default layer named after `object`.
 - **UserString** `part_id` = the canonical ledger key (survives renames; the fallback resolver).
+- **UserString** `stage` = the build stage id (§12). This is the scoped delete key that makes a
+  re-emit idempotent without wiping the whole model. Stamp it on **every** baked object.
 - Optionally `UserString "provenance"` = the IR `provenance` string for debugging.
 
 ```python
@@ -321,3 +325,96 @@ Two independent limits, never a single global counter:
   (revolve, shell, network surface). The model over-loves writing Python; resist it.
 - Scripts are executed via `${CLAUDE_SKILL_DIR}` and **only their stdout enters context** — print
   the one result you need (e.g. a GUID), not debug noise.
+
+---
+
+## 12. Scoped idempotent staged emit
+
+The emit protocol is **staged**, and every stage is **scoped-idempotent**. This defeats three
+observed failure modes at once: the MCP `execute_*` wrapper silently running a script **twice**
+(doubling the geometry); a single fragile op (e.g. a missing `Brep.CreateOffset` overload) rolling
+back an entire one-shot build; and editing one feature forcing a wipe-and-rebuild of the whole model.
+
+**Definitions.**
+- A **stage** is a named, ordered slice of the IR `parts` (declared in the IR `stages[]` array, or
+  inline per-part via `part.stage`; a part with neither belongs to the implicit `default` stage).
+  Stages bake and reconcile as **one unit**, then **checkpoint**, before the next stage runs.
+- **Scoped idempotent** means a stage script first **deletes only the live objects that belong to
+  THIS stage** (matched by `UserString "stage"`, an explicit `part_id` allow-list, or a layer
+  scope), then re-creates them once. Re-running the same stage script therefore converges to exactly
+  one copy of that stage — and touches no other stage.
+
+**The stage emit shape (non-negotiable).** Each stage is emitted as a SINGLE `execute_*` call whose
+body is: *(1) the scoped purge preamble → (2) the snapshot for the create-then-find-newest shim →
+(3) the guarded `Create*`/bake code for this stage's parts, each stamped with `UserString "stage"`.*
+Generate the preamble with the helper rather than hand-writing the delete loop:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scripts/stage_emit.py" \
+  --stage bell_chamber \
+  --part-ids bell_floor,bell_col_0,bell_col_1
+```
+
+It prints a ready-to-run preamble that defines and runs `purge_stage()`:
+
+```python
+#! python3
+import scriptcontext as sc, Rhino, json
+STAGE = 'bell_chamber'
+PART_IDS = {'bell_floor', 'bell_col_0', 'bell_col_1'}
+
+def _obj_in_stage(obj):
+    a = obj.Attributes
+    if a.GetUserString("stage") == STAGE:           # primary scope key
+        return True
+    if PART_IDS is not None and a.GetUserString("part_id") in PART_IDS:
+        return True
+    return False
+
+def purge_stage():
+    doomed = [o.Id for o in sc.doc.Objects if _obj_in_stage(o)]
+    return sum(1 for g in doomed if sc.doc.Objects.Delete(g, True))   # quiet=True
+
+_deleted = purge_stage()
+# Snapshot AFTER the purge so deleted objects never confuse find_newest_guid (§2).
+_stage_before_ids = set(o.Id for o in sc.doc.Objects)
+print(json.dumps({"stage": STAGE, "deleted": _deleted}))
+# ---- append this stage's guarded Create*/bake below; stamp stage on every bake ----
+```
+
+**Ordering of purge vs. snapshot is load-bearing.** The §2 `find_newest_guid` shim asserts *exactly
+one new object*. Take its `_stage_before_ids` snapshot **after** `purge_stage()` so the per-bake diff
+sees only genuinely new objects. (Phase-0's pre-mutation snapshot is per-stage, not per-build.)
+
+**Stage boundary = bake + reconcile + checkpoint.** A stage is "done" only when its parts baked,
+`reconcile.py --stage <id>` passes for that stage's nodes, and the modeling skill writes a
+**checkpoint** into the scene-graph (`checkpoints[]`: `{stage, status:"passed", revision, part_ids}`)
+and **Saves the .3dm** (`Rhino.RhinoDoc.ActiveDoc.Save(...)` via the MCP save tool). The save makes
+the checkpoint the persisted ledger (defeats the "30-minute session never saved" loss).
+
+**Why this self-corrects the double-execution.** If the wrapper runs the stage script twice, the
+second run's `purge_stage()` deletes the first run's objects (they carry the same `stage` tag) before
+re-creating them, so the document ends with exactly one copy. No whole-model wipe is needed.
+
+**Why this bounds a fragile-op failure.** A stage failure (a Create returns null) aborts only that
+stage; earlier stages are already baked, checkpointed and saved. The repair loop re-emits **just the
+failed stage** (its idempotent purge cleans any partial bake from the aborted attempt first). No
+prior stage is touched, and the count never doubles.
+
+**Scoped re-emit for an edit.** To change the bell chamber on a 931-solid tower, re-run only the
+`bell_chamber` stage script: it purges + rebuilds those parts, you reconcile `--stage bell_chamber`,
+re-checkpoint, and re-verify only the stages whose `depends_on` includes `bell_chamber`. The shaft
+and base are never rebuilt.
+
+**Ledger consistency across stages.** The scene-graph stays consistent because (a) each node records
+its `stage`; (b) a stage re-emit replaces exactly that stage's nodes (delete by stage, then append
+the new GUIDs) and bumps `revision`; (c) `checkpoints[]` records the last passing revision per stage
+so a resumed/edited build knows what is already good. `reconcile.py --stage <id>` filters expected
+nodes to that stage and ignores live objects tagged with other stages, so a per-stage diff never
+reports another stage's parts as EXTRA.
+
+**Sizing a stage.** One stage per natural assembly (base / shaft / colonnade / bell chamber), or per
+`count`-instanced family, capped so a stage is a few-dozen solids — small enough that a re-emit is
+cheap, large enough that reconcile has a meaningful unit. Booleans must stay **within one stage**
+(their inputs and result share a stage) so a `child_of` consumption is never split across a stage
+boundary.

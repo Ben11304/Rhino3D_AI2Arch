@@ -45,6 +45,25 @@
       "type": "array",
       "description": "Realized spatial/logical relations between nodes, mirroring the IR relation set. Each edge names a relation type and its two endpoint part_ids.",
       "items": { "$ref": "#/$defs/edge" }
+    },
+    "checkpoints": {
+      "type": "array",
+      "description": "Per-stage build checkpoints (conventions §12). One entry per stage that has been baked + reconciled, recording its pass/fail status and the revision at which it last passed. Lets a staged build resume after a crash, lets a re-emit of one stage skip already-passing stages, and (with the .3dm Save the modeling skill triggers at each checkpoint) is the persisted ledger that survives a rollback (E11).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage", "status", "revision"],
+        "properties": {
+          "stage": { "type": "string", "minLength": 1, "description": "Stage id, matching node.stage and the IR stages[].id." },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "passed", "failed"],
+            "description": "passed = this stage baked and reconciled clean; failed = reconcile flagged a defect not yet repaired; pending = declared but not yet built."
+          },
+          "revision": { "type": "integer", "minimum": 0, "description": "scene-graph revision at which this stage last reached 'status'. The .3dm was saved at this revision (E11)." },
+          "part_ids": { "type": "array", "items": { "type": "string" }, "description": "Part ids this checkpoint covers (the stage's parts), so a re-emit knows exactly what to purge + rebuild." }
+        }
+      }
     }
   },
   "$defs": {
@@ -107,6 +126,10 @@
         "layer": {
           "type": "string",
           "description": "Target Rhino layer name the object lives on, mirroring the IR part.layer."
+        },
+        "stage": {
+          "type": "string",
+          "description": "Build stage that baked this node, mirroring the IR part.stage / stages[].id and the baked object's UserString 'stage' (conventions §12). Lets reconcile run SCOPED to a single stage (--stage) so re-emitting one stage is checked against only that stage's expected nodes, not the whole model."
         },
         "primitive": {
           "type": "string",

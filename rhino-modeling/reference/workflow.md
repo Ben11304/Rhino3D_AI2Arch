@@ -25,7 +25,11 @@ Owner: **rhino-modeling**.
    Never bake a literal `0.001`. (conventions §1)
 2. **Snapshot before mutating.** Call `get_document_summary` to capture the pre-mutation object set
    (ids only). This is the baseline for the create-then-find-newest GUID diff and for the
-   expected-count checks. Prefer the summary over a full `get_objects` dump (conventions §11).
+   expected-count checks. Prefer the summary over a full `get_objects` dump (conventions §11). Note:
+   EMIT is **staged** (conventions §12), so the load-bearing GUID-diff snapshot is taken
+   **per-stage, AFTER that stage's scoped purge**, inside the stage script — not once for the whole
+   build. This Phase-0 snapshot is the build-wide baseline; the per-stage snapshot is what
+   `find_newest_guid` actually diffs against.
 
 **Decision point P0:** is the document in the right unit system and is the snapshot recorded? If
 not, stop — do not emit geometry against an unknown frame/tolerance.
@@ -126,19 +130,37 @@ in `units`? If not, repair the IR before emitting — never patch with ad-hoc co
 
 ---
 
-## Phase 4 — EMIT (orchestrator + geometry-api)
+## Phase 4 — EMIT (orchestrator + geometry-api), STAGED + scoped-idempotent
 
 Owner: **rhino-modeling** drives; codegen shape comes from **rhino-geometry-api**.
 
-Walk the IR `parts` / `boolean_plan` in order, emitting guarded geometry per the contract above.
-Typed-tool-first; `execute_*` only for revolve/shell/network surface. For every primitive: author
-on WorldXY, transform to `frame`. For every operation: pre-flight inputs, create, null-check,
-validate. For every union: interpenetrate the inputs by `penetration` first, then
-`Brep.CreateBooleanUnion`, then the count+volume guard.
+Emit is **staged**, and every stage is **scoped-idempotent** (conventions §12). Do **not** emit the
+whole model as one atomic script — that is what let a single `Brep.CreateOffset` failure roll back
+all 931 solids, and what let the double-execution wrapper double the geometry. Instead walk the IR
+`stages[]` in `depends_on` order (a part with no stage is the implicit `default` stage), and for
+**each stage** emit ONE `execute_*` call shaped as:
 
-**Decision point P4:** did each `Create*` return non-null and did each result pass
-`IsValid`/`IsSolid`/`GetNakedEdges`? A failure here routes straight to REPAIR (Phase 7) for that
-item, not a silent continue.
+1. **Scoped purge preamble.** Generate it with the helper, then concatenate your bake code after it:
+   ```bash
+   python3 "${CLAUDE_SKILL_DIR}/../rhino-scene-state/scripts/stage_emit.py" \
+     --stage <stage_id> --part-ids <id1>,<id2>,...
+   ```
+   It deletes only the live objects tagged with this `stage` (or in the `part_id` allow-list), then
+   snapshots `_stage_before_ids` **after** the purge for the create-then-find-newest shim.
+2. **Guarded bake of this stage's parts** (the §5 codegen contract): for every primitive author on
+   WorldXY → transform to `frame`; for every operation pre-flight inputs, create, null-check,
+   validate; for every union interpenetrate by `penetration`, `Brep.CreateBooleanUnion`, then the
+   count+volume guard. Stamp `attr.SetUserString("stage", <stage_id>)` and `"part_id"` on **every**
+   bake so the next re-run can find and purge it.
+
+Booleans must live **inside one stage** (inputs + result share a stage) so a `child_of` consumption
+never crosses a stage boundary.
+
+**Decision point P4:** did each `Create*` in the stage return non-null and pass
+`IsValid`/`IsSolid`/`GetNakedEdges`? A failure aborts **only this stage** and routes straight to
+REPAIR (Phase 7) for the failing item — earlier stages are already baked, reconciled, checkpointed
+and saved, so they are not touched. The idempotent purge means re-running the stage cleans any
+partial bake from the aborted attempt before rebuilding.
 
 ---
 
@@ -147,16 +169,23 @@ item, not a silent continue.
 Owner: **rhino-scene-state**.
 
 - At bake time, capture the **GUID** returned by `AddBrep` / `AddCurve` / `AddSurface` and write
-  `part_id -> GUID` into the scene-graph artifact.
+  `part_id -> GUID` (with `stage`) into the scene-graph artifact node.
 - **Every mutator must return its GUID.** Typed tools that don't return one are wrapped in a
-  **create-then-find-newest** shim: diff the current object table against the Phase-0 snapshot;
-  exactly one new object is expected.
-- Tag each object with `UserString "part_id"` (and optionally `provenance`) — the **fallback
-  resolver** when a GUID is lost after a boolean consumes its inputs (conventions §2/§3, C1).
+  **create-then-find-newest** shim: diff the current object table against the **per-stage**
+  `_stage_before_ids` snapshot (taken after the scoped purge, conventions §12); exactly one new
+  object is expected.
+- Tag each object with `UserString "part_id"`, `UserString "stage"` (and optionally `provenance`) —
+  `part_id` is the **fallback resolver** when a GUID is lost after a boolean consumes its inputs, and
+  `stage` is the **scoped idempotent delete key** for a re-emit (conventions §2/§3/§12, C1).
+- **At the stage boundary, CHECKPOINT.** After this stage's parts baked and `reconcile.py --stage
+  <id>` passes, append `checkpoints[]: {stage, status:"passed", revision, part_ids}` to the
+  scene-graph, bump `revision`, set `last_op`, and **Save the .3dm** (via the MCP save tool /
+  `RhinoDoc.Save`). The save is what persists the ledger across a crash or rollback (defeats E11).
 
-**Decision point P5:** is every IR part id present as a key in the scene-graph with a live GUID? A
-missing key means a part was silently dropped (common after a partial boolean, C2) — route to
-REPAIR.
+**Decision point P5:** is every part id of THIS stage present as a node with a live GUID, and did the
+scoped reconcile pass? A missing key means a part was silently dropped (common after a partial
+boolean, C2) — route to REPAIR for this stage only. On pass, checkpoint + save, then advance to the
+next stage.
 
 ---
 
@@ -194,8 +223,12 @@ Bounded fix loop with **two independent limits (C8)**:
   any single budget. Hitting the wall stops the loop and reports remaining defects.
 
 Each repair re-renders / re-measures **only the affected parts** (read their GUIDs from the
-scene-graph; never re-query unchanged geometry). Repairs are driven by the IR `verify` block and the
-same vision/math routing.
+scene-graph; never re-query unchanged geometry). When a repair must re-bake geometry it **re-emits
+only the affected stage** (conventions §12): re-run that stage's scoped-idempotent script, which
+purges and rebuilds just that stage's objects, then reconcile `--stage <id>` and re-checkpoint. No
+prior stage is rebuilt, so a fix to one feature never disturbs the rest of a 931-solid model, and the
+idempotent purge guarantees the re-bake does not duplicate geometry. Repairs are driven by the IR
+`verify` block and the same vision/math routing.
 
 **Decision point P7:** after a repair, re-run the affected SEE checks. Pass -> continue. Budget or
 wall hit -> stop and surface.
@@ -215,17 +248,21 @@ guard) must be reported, not hidden.
 
 ## Loop-control summary
 
+EMIT→REMEMBER→(reconcile)→checkpoint loops **per stage** (conventions §12) before the whole-model
+SEE pass; a stage failure routes to REPAIR for that stage only.
+
 ```
 P0 PREAMBLE   --(units/snapshot ok?)-->        P1 ROUTE
 P1 ROUTE      --(producer+server ok?)-->       P2 KNOW-API
 P2 KNOW-API   --(typed tool? else execute_*)-> P3 PLAN
-P3 PLAN       --(IR validates?)-->             P4 EMIT
-P4 EMIT       --(Create* valid?)--+fail------> P7 REPAIR
-              \--ok-------------->             P5 REMEMBER
-P5 REMEMBER   --(all part ids mapped?)--+fail-> P7 REPAIR
-              \--ok-------------->             P6 SEE
-P6 SEE        --(verify pass?)--+fail--------> P7 REPAIR
+P3 PLAN       --(IR validates?)-->             P4 EMIT (per stage, scoped-idempotent)
+  for each stage in depends_on order:
+    P4 EMIT     --(purge-stage; Create* valid?)--+fail--> P7 REPAIR (this stage only)
+                \--ok-------------->             P5 REMEMBER (stamp stage + GUID)
+    P5 REMEMBER --(stage reconcile --stage ok?)--+fail--> P7 REPAIR (this stage only)
+                \--ok-------------->             CHECKPOINT + Save .3dm --> next stage
+P6 SEE        --(whole-model verify pass?)--+fail--------> P7 REPAIR
               \--pass----------->             P8 REPORT
-P7 REPAIR     --(budget/wall left?)--+yes----> re-EMIT/re-SEE affected
+P7 REPAIR     --(budget/wall left?)--+yes----> re-EMIT affected STAGE / re-SEE affected
               \--no------------->             P8 REPORT (surface "could not fix")
 ```

@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 venv/
 
+# Local Claude Code / MCP machine config (not part of the suite)
+.mcp.json
+.claude/settings.local.json
+
 # macOS
 .DS_Store
 
